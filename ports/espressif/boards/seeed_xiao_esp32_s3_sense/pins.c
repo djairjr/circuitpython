@@ -2,7 +2,6 @@
 
 STATIC const mp_rom_map_elem_t board_module_globals_table[] = {
     CIRCUITPYTHON_BOARD_DICT_STANDARD_ITEMS
-
     { MP_ROM_QSTR(MP_QSTR_A0), MP_ROM_PTR(&pin_GPIO1) },
     { MP_ROM_QSTR(MP_QSTR_D0), MP_ROM_PTR(&pin_GPIO1) },
     { MP_ROM_QSTR(MP_QSTR_A1), MP_ROM_PTR(&pin_GPIO2) },
@@ -24,11 +23,9 @@ STATIC const mp_rom_map_elem_t board_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_D8), MP_ROM_PTR(&pin_GPIO7) },    
     { MP_ROM_QSTR(MP_QSTR_D9), MP_ROM_PTR(&pin_GPIO8) },
     { MP_ROM_QSTR(MP_QSTR_D10), MP_ROM_PTR(&pin_GPIO9) },
-    
     { MP_ROM_QSTR(MP_QSTR_SCK), MP_ROM_PTR(&pin_GPIO7) },    
     { MP_ROM_QSTR(MP_QSTR_MISO), MP_ROM_PTR(&pin_GPIO8) },
-    { MP_ROM_QSTR(MP_QSTR_MOSI), MP_ROM_PTR(&pin_GPIO9) },
-    
+    { MP_ROM_QSTR(MP_QSTR_MOSI), MP_ROM_PTR(&pin_GPIO9) },  
     { MP_ROM_QSTR(MP_QSTR_XCLK), MP_ROM_PTR(&pin_GPIO10) },
     { MP_ROM_QSTR(MP_QSTR_Y8), MP_ROM_PTR(&pin_GPIO11) },
     { MP_ROM_QSTR(MP_QSTR_Y7), MP_ROM_PTR(&pin_GPIO12) },
@@ -37,21 +34,18 @@ STATIC const mp_rom_map_elem_t board_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_Y2), MP_ROM_PTR(&pin_GPIO15) },
     { MP_ROM_QSTR(MP_QSTR_Y5), MP_ROM_PTR(&pin_GPIO16) },
     { MP_ROM_QSTR(MP_QSTR_Y3), MP_ROM_PTR(&pin_GPIO17) },
-    { MP_ROM_QSTR(MP_QSTR_Y4), MP_ROM_PTR(&pin_GPIO18) },
-    
+    { MP_ROM_QSTR(MP_QSTR_Y4), MP_ROM_PTR(&pin_GPIO18) },    
     { MP_ROM_QSTR(MP_QSTR_LED), MP_ROM_PTR(&pin_GPIO21) },
     { MP_ROM_QSTR(MP_QSTR_SDCS), MP_ROM_PTR(&pin_GPIO21) },
- 
     { MP_ROM_QSTR(MP_QSTR_VSYNC), MP_ROM_PTR(&pin_GPIO38) },
     { MP_ROM_QSTR(MP_QSTR_MTCK), MP_ROM_PTR(&pin_GPIO39) },
     { MP_ROM_QSTR(MP_QSTR_MTDO), MP_ROM_PTR(&pin_GPIO40) },
-    
-    
     { MP_ROM_QSTR(MP_QSTR_I2S_MIC), MP_ROM_PTR(&pin_GPIO41) },
     { MP_ROM_QSTR(MP_QSTR_MTDI), MP_ROM_PTR(&pin_GPIO41) },    
     { MP_ROM_QSTR(MP_QSTR_MTMS), MP_ROM_PTR(&pin_GPIO42) }, 
     { MP_ROM_QSTR(MP_QSTR_I2S_FS), MP_ROM_PTR(&pin_GPIO42) },
-    
+    { MP_ROM_QSTR(MP_QSTR_I2C), MP_ROM_PTR(&board_i2c_obj) },
+    { MP_ROM_QSTR(MP_QSTR_SPI), MP_ROM_PTR(&board_spi_obj) },
     { MP_ROM_QSTR(MP_QSTR_UART), MP_ROM_PTR(&board_uart_obj) },
 };
 MP_DEFINE_CONST_DICT(board_module_globals, board_module_globals_table);

@@ -42,35 +42,43 @@ from zephyr2cp import zephyr_dts_to_cp_board
 compiler = cpbuild.Compiler(srcdir, builddir, cmake_args)
 
 ALWAYS_ON_MODULES = ["sys", "collections"]
+# Keep in alphabetical order.
 DEFAULT_MODULES = [
     "__future__",
-    "time",
-    "os",
-    "microcontroller",
-    "struct",
+    "adafruit_bus_device",
+    "aesio",
     "array",
-    "json",
-    "random",
+    "asyncio",
+    "atexit",
+    "binascii",
+    "bitbangio",
+    "codeop",
     "digitalio",
-    "rotaryio",
+    "errno",
+    "getpass",
+    "hashlib",
+    "io",
+    "json",
+    "keypad",
+    "keypad_demux",
+    "locale",
+    "math",
+    "microcontroller",
+    "msgpack",
+    "os",
     "rainbowio",
+    "random",
+    "re",
+    "rotaryio",
+    "select",
+    "storage",
+    "struct",
+    "supervisor",
+    "time",
+    "touchio",
     "traceback",
     "warnings",
-    "supervisor",
-    "errno",
-    "io",
-    "math",
-    "msgpack",
-    "aesio",
-    "hashlib",
     "zlib",
-    "adafruit_bus_device",
-    "getpass",
-    "storage",
-    "binascii",
-    "re",
-    "asyncio",
-    "select",
 ]
 # Flags that don't match with with a *bindings module. Some used by adafruit_requests
 MPCONFIG_FLAGS = ["array", "errno", "io", "json", "math", "binascii"]
@@ -93,6 +101,7 @@ REVERSE_DEPENDENCIES = {
     "busio": ["fourwire", "i2cdisplaybus", "sdcardio", "sharpdisplay"],
     "fourwire": ["displayio", "busdisplay", "epaperdisplay"],
     "i2cdisplaybus": ["displayio", "busdisplay", "epaperdisplay"],
+    "neopixel_write": ["adafruit_pixelbuf", "_pixelmap"],
     # Zephyr display backends need displayio and, by extension, terminalio so
     # the REPL console appears on the display by default.
     "zephyr_display": ["displayio"],
@@ -114,9 +123,11 @@ REVERSE_DEPENDENCIES = {
 # Other flags to set when a module is enabled
 EXTRA_FLAGS = {
     "audiobusio": {"AUDIOBUSIO_I2SOUT": 1, "AUDIOBUSIO_PDMIN": 0},
-    "busio": {"BUSIO_SPI": 1, "BUSIO_I2C": 1},
+    "busio": {"BUSIO_SPI": 1, "BUSIO_I2C": 1, "BUSIO_UART": 1},
+    "keypad": {"KEYPAD_KEYMATRIX": 1, "KEYPAD_KEYS": 1, "KEYPAD_SHIFTREGISTERKEYS": 1},
     "rotaryio": {"ROTARYIO_SOFTENCODER": 1},
     "synthio": {"SYNTHIO_MAX_CHANNELS": 12},
+    "touchio": {"TOUCHIO_USE_NATIVE": 0},
 }
 
 # Library sources. Will be globbed from the top level directory
@@ -168,20 +179,25 @@ async def preprocess_and_split_defs(compiler, source_file, build_path, flags):
             )
 
 
+def _concatenate_if_changed(inputs, output_file):
+    """Write the concatenation of inputs to output_file, but only if it differs from what is
+    already there, so an unchanged output keeps its modification time."""
+    content = "".join(path.read_text() for path in inputs)
+    if not output_file.exists() or output_file.read_text() != content:
+        output_file.write_text(content)
+
+
 async def collect_defs(mode, build_path):
     output_file = build_path / f"{mode}defs.collected"
     splitdir = build_path / "genhdr" / mode
-    to_collect = list(splitdir.glob(f"**/*.{mode}"))
-    batch_size = 50
-    await cpbuild.run_command(
-        ["cat", "-s", *to_collect[:batch_size], ">", output_file],
-        splitdir,
+    # Sorted so the output does not depend on directory order.
+    to_collect = sorted(splitdir.glob(f"**/*.{mode}"))
+    await cpbuild.run_function(
+        _concatenate_if_changed,
+        (to_collect, output_file),
+        {},
+        description=f"Collect {mode} definitions -> {output_file.relative_to(build_path)}",
     )
-    for i in range(0, len(to_collect), batch_size):
-        await cpbuild.run_command(
-            ["cat", "-s", *to_collect[i : i + batch_size], ">>", output_file],
-            splitdir,
-        )
     return output_file
 
 
@@ -189,9 +205,13 @@ async def generate_qstr_headers(build_path, compiler, flags, translation):
     collected = await collect_defs("qstr", build_path)
     generated = build_path / "genhdr" / "qstrdefs.generated.h"
 
+    # check_hash: the collected file is rewritten on every build, so this reruns every
+    # build too. Keep the old modification time when the header comes out unchanged, or
+    # every file that includes it would be recompiled.
     await cpbuild.run_command(
         ["python", srcdir / "py" / "makeqstrdata.py", collected, ">", generated],
         srcdir,
+        check_hash=[generated],
     )
 
     compression_level = 9
@@ -230,29 +250,21 @@ async def generate_qstr_headers(build_path, compiler, flags, translation):
 
 async def generate_module_header(build_path):
     collected = await collect_defs("module", build_path)
+    generated = build_path / "genhdr" / "moduledefs.h"
     await cpbuild.run_command(
-        [
-            "python",
-            srcdir / "py" / "makemoduledefs.py",
-            collected,
-            ">",
-            build_path / "genhdr" / "moduledefs.h",
-        ],
+        ["python", srcdir / "py" / "makemoduledefs.py", collected, ">", generated],
         srcdir,
+        check_hash=[generated],
     )
 
 
 async def generate_root_pointer_header(build_path):
     collected = await collect_defs("root_pointer", build_path)
+    generated = build_path / "genhdr" / "root_pointers.h"
     await cpbuild.run_command(
-        [
-            "python",
-            srcdir / "py" / "make_root_pointers.py",
-            collected,
-            ">",
-            build_path / "genhdr" / "root_pointers.h",
-        ],
+        ["python", srcdir / "py" / "make_root_pointers.py", collected, ">", generated],
         srcdir,
+        check_hash=[generated],
     )
 
 
@@ -303,15 +315,32 @@ def determine_enabled_modules(board_info, portdir, srcdir):
     enabled_modules = set(DEFAULT_MODULES)
     module_reasons = {}
 
+    # The board module is always built: shared-bindings/board/__init__.c and the
+    # generated pin/board.c are compiled unconditionally in build_circuitpython().
+    enabled_modules.add("board")
+    module_reasons["board"] = "Always enabled"
+
     if board_info["wifi"]:
         enabled_modules.add("wifi")
         module_reasons["wifi"] = "Zephyr board has wifi"
+
+    if board_info.get("ethernet", False):
+        enabled_modules.add("mii")
+        module_reasons["mii"] = "Zephyr board has ethernet"
 
     if board_info["flash_count"] > 0:
         enabled_modules.add("storage")
         module_reasons["storage"] = "Zephyr board has flash"
 
-    network_enabled = board_info.get("wifi", False) or board_info.get("hostnetwork", False)
+    if board_info.get("nvm_size", 0) > 0:
+        enabled_modules.add("nvm")
+        module_reasons["nvm"] = "Board has NVM partition"
+
+    network_enabled = (
+        board_info.get("wifi", False)
+        or board_info.get("ethernet", False)
+        or board_info.get("hostnetwork", False)
+    )
 
     if network_enabled:
         enabled_modules.add("ipaddress")
@@ -321,17 +350,29 @@ def determine_enabled_modules(board_info, portdir, srcdir):
         enabled_modules.add("hashlib")
         module_reasons["hashlib"] = "Zephyr networking enabled"
 
-    if board_info.get("wifi", False) or board_info.get("ethernet", False):
+    if board_info.get("wifi", False):
         enabled_modules.add("ssl")
-        module_reasons["ssl"] = "Zephyr networking enabled"
+        module_reasons["ssl"] = "Zephyr wifi enabled"
+    elif board_info.get("ethernet", False):
+        enabled_modules.add("ssl")
+        module_reasons["ssl"] = "Zephyr ethernet enabled"
+    elif board_info.get("hostnetwork", False):
+        enabled_modules.add("ssl")
+        module_reasons["ssl"] = "Zephyr hostnetwork enabled"
 
-    for port_module in (portdir / "bindings").iterdir():
+    # Iterate the shared-bindings directory in a stable (sorted) order. Several
+    # modules can enable the same reverse dependency, and the "reason" comment
+    # recorded in autogen_board_info.toml belongs to whichever module enabled it
+    # first. Directory iteration order is filesystem dependent (it differs
+    # between machines and CI runners), so an unsorted walk made the generated
+    # comments - and therefore the committed toml files - change between builds.
+    for port_module in sorted((portdir / "bindings").iterdir(), key=lambda x: x.name):
         if not board_info.get(port_module.name, False):
             continue
         enabled_modules.add(port_module.name)
         module_reasons[port_module.name] = f"Zephyr board has {port_module.name}"
 
-    for shared_module in (srcdir / "shared-bindings").iterdir():
+    for shared_module in sorted((srcdir / "shared-bindings").iterdir(), key=lambda x: x.name):
         if not board_info.get(shared_module.name, False) or not shared_module.glob("*.c"):
             continue
         enabled_modules.add(shared_module.name)
@@ -361,14 +402,18 @@ async def build_circuitpython():  # noqa: C901
     board = cmake_args["BOARD_ALIAS"]
     if not board:
         board = zephyr_board
-    translation = cmake_args["TRANSLATION"]
-    if not translation:
-        translation = "en_US"
+    # The environment wins, so the Makefile can switch languages without a reconfigure.
+    translation = os.environ.get("TRANSLATION") or cmake_args["TRANSLATION"] or "en_US"
     for module in ALWAYS_ON_MODULES:
         circuitpython_flags.append(f"-DCIRCUITPY_{module.upper()}=1")
     lto = cmake_args.get("LTO", "n") == "y"
     circuitpython_flags.append(f"-DCIRCUITPY_ENABLE_MPY_NATIVE={1 if enable_mpy_native else 0}")
     circuitpython_flags.append(f"-DCIRCUITPY_FULL_BUILD={1 if full_build else 0}")
+    # Zephyr does not reset all pins in bulk on soft reset, so never_reset is
+    # compiled out and hardware is released by GC finalizers instead.
+    circuitpython_flags.append("-DCIRCUITPY_BULK_RESET=0")
+    circuitpython_flags.append("-DCIRCUITPY_OPT_LOAD_ATTR_FAST_PATH=1")
+    circuitpython_flags.append(f"-DCIRCUITPY_OPT_MAP_LOOKUP_CACHE={1 if full_build else 0}")
     circuitpython_flags.append(f"-DCIRCUITPY_SETTINGS_TOML={1 if full_build else 0}")
     circuitpython_flags.append(f"-DMICROPY_PY_ASYNC_AWAIT={1 if full_build else 0}")
     circuitpython_flags.append(f"-DMICROPY_PY_ASYNCIO={1 if full_build else 0}")
@@ -427,6 +472,16 @@ async def build_circuitpython():  # noqa: C901
 
     autogen_board_info_fn = mpconfigboard_fn.parent / "autogen_board_info.toml"
 
+    # Filesystem type is a compile-time choice made by the partition layout:
+    # zephyr2cp reports littlefs when the devicetree has a littlefs_partition
+    # node, otherwise the supervisor mounts FAT.
+    filesystem_littlefs = board_info.get("littlefs", False)
+    circuitpython_flags.append(
+        f"-DCIRCUITPY_FILESYSTEM_LITTLEFS={1 if filesystem_littlefs else 0}"
+    )
+    if filesystem_littlefs:
+        circuitpython_flags.append("-DMICROPY_VFS_LFS2=1")
+
     creator_id = mpconfigboard.get("CIRCUITPY_CREATOR_ID", mpconfigboard.get("USB_VID", 0x1209))
     creation_id = mpconfigboard.get("CIRCUITPY_CREATION_ID", mpconfigboard.get("USB_PID", 0x000C))
     circuitpython_flags.append(f"-DCIRCUITPY_CREATOR_ID=0x{creator_id:08x}")
@@ -439,7 +494,11 @@ async def build_circuitpython():  # noqa: C901
     for m in mpconfigboard.get("DISABLED_MODULES", []):
         enabled_modules.discard(m)
 
-    web_workflow_enabled = board_info.get("wifi", False) or board_info.get("hostnetwork", False)
+    web_workflow_enabled = (
+        board_info.get("wifi", False)
+        or board_info.get("hostnetwork", False)
+        or "mii" in enabled_modules
+    )
 
     circuitpython_flags.extend(board_info["cflags"])
     circuitpython_flags.append(f"-DCIRCUITPY_WEB_WORKFLOW={1 if web_workflow_enabled else 0}")
@@ -453,6 +512,7 @@ async def build_circuitpython():  # noqa: C901
         "extmod/vfs_fat.c",
         "lib/tlsf/tlsf.c",
         portdir / "background.c",
+        portdir / "supervisor/adaboot_info.c",
         portdir / "common-hal/microcontroller/__init__.c",
         portdir / "common-hal/microcontroller/Pin.c",
         portdir / "common-hal/microcontroller/Processor.c",
@@ -479,17 +539,40 @@ async def build_circuitpython():  # noqa: C901
     supervisor_source = [pathlib.Path(p) for p in supervisor_source]
     supervisor_source.extend(board_info["source_files"])
     supervisor_source.extend(top.glob("supervisor/shared/*.c"))
-    if "_bleio" in enabled_modules:
+    ble_workflow_enabled = "_bleio" in enabled_modules
+    if ble_workflow_enabled:
         supervisor_source.append(top / "supervisor/shared/bluetooth/bluetooth.c")
+        # BLE workflow = file transfer + serial services, matching other ports.
+        supervisor_source.append(top / "supervisor/shared/bluetooth/file_transfer.c")
+        supervisor_source.append(top / "supervisor/shared/bluetooth/serial.c")
+    circuitpython_flags.append(f"-DCIRCUITPY_BLE_FILE_SERVICE={1 if ble_workflow_enabled else 0}")
+    circuitpython_flags.append(
+        f"-DCIRCUITPY_BLE_SERIAL_SERVICE={1 if ble_workflow_enabled else 0}"
+    )
     supervisor_source.append(top / "supervisor/shared/translate/translate.c")
     if web_workflow_enabled:
         supervisor_source.extend(top.glob("supervisor/shared/web_workflow/*.c"))
 
     usb_ok = board_info.get("usb_device", False)
+    if usb_ok and filesystem_littlefs:
+        # USB MSC can only expose a FAT block image; a littlefs CIRCUITPY has
+        # no MSC-compatible layout and USB MSC of it would corrupt the drive.
+        # Rename the filesystem partition to fatfs_partition in the board's
+        # Adaboot layout dtsi, or remove the USB device from the devicetree.
+        raise SystemExit(
+            f"{board}: littlefs CIRCUITPY filesystem is incompatible with USB. "
+            "Rename the littlefs_partition node to fatfs_partition in the board's "
+            "layout dtsi, or disable the USB device controller in the devicetree."
+        )
     circuitpython_flags.append(f"-DCIRCUITPY_USB_DEVICE={1 if usb_ok else 0}")
 
     if usb_ok:
         enabled_modules.add("usb_cdc")
+        enabled_modules.add("usb_hid")
+
+        usb_num_endpoint_pairs = board_info.get("usb_num_endpoint_pairs", 4)
+        circuitpython_flags.append(f"-DUSB_NUM_ENDPOINT_PAIRS={usb_num_endpoint_pairs}")
+        circuitpython_flags.append("-DCIRCUITPY_USB_HID_ENABLED_DEFAULT=1")
 
         for macro in ("USB_PID", "USB_VID"):
             print(f"Setting {macro} to {mpconfigboard.get(macro)}")
@@ -594,20 +677,15 @@ async def build_circuitpython():  # noqa: C901
             # Only include shared-module/*.c if no common-hal/*.c files were found
             if len(hal_source) == len_before or module.name in SHARED_MODULE_AND_COMMON_HAL:
                 hal_source.extend(top.glob(f"shared-module/{module.name}/**/*.c"))
+            # The USB HID report descriptors are shared with the TinyUSB ports and
+            # have no common-hal override, so always compile them.
+            if module.name == "usb_hid":
+                hal_source.append(top / "shared-module/usb_hid/report_descriptors.c")
             hal_source.extend(top.glob(f"shared-bindings/{module.name}/**/*.c"))
             if module.name in LIBRARY_SOURCE:
                 for library_source in LIBRARY_SOURCE[module.name]:
                     library_sources.extend(top.glob(library_source))
 
-    if os.environ.get("CI", "false") == "true":
-        # Warn if it isn't up to date.
-        if (
-            not autogen_board_info_fn.exists()
-            or autogen_board_info_fn.read_text() != tomlkit.dumps(autogen_board_info)
-        ):
-            logger.warning(
-                f"autogen_board_info.toml is missing or out of date. Please run `make BOARD={board}` locally and commit {autogen_board_info_fn}."
-            )
     autogen_modules.add(tomlkit.comment("extmod modules shared with MicroPython"))
     for extmod_module in EXTMOD_MODULES:
         enabled = extmod_module in enabled_modules
@@ -618,14 +696,80 @@ async def build_circuitpython():  # noqa: C901
         flag_name = MODULE_FLAG_NAMES.get(extmod_module, extmod_module.upper())
         circuitpython_flags.append(f"-DCIRCUITPY_{flag_name}={1 if enabled else 0}")
 
+    if os.environ.get("CI", "false") == "true":
+        # Warn if it isn't up to date.
+        if (
+            not autogen_board_info_fn.exists()
+            or autogen_board_info_fn.read_text() != tomlkit.dumps(autogen_board_info)
+        ):
+            logger.warning(
+                f"autogen_board_info.toml is missing or out of date. Please run `make BOARD={board}` locally and commit {autogen_board_info_fn}."
+            )
+            # Also as an annotation, so it shows on the run and next to the file in the
+            # pull request rather than in one board log out of 29. The board builds once
+            # per language, so only the first build of it says anything.
+            reported = builddir / "autogen_board_info.reported"
+            if not reported.exists():
+                reported.touch()
+                print(
+                    f"::warning file={autogen_board_info_fn.relative_to(srcdir)}::"
+                    f"out of date, run `make BOARD={board}` and commit it",
+                    flush=True,
+                )
+
     if autogen_board_info_fn.parent.exists():
         autogen_board_info_fn.write_text(tomlkit.dumps(autogen_board_info))
+
+    # Set NVM size from the board's NVM partition.
+    nvm_size = board_info.get("nvm_size", 0)
+    circuitpython_flags.append(f"-DCIRCUITPY_INTERNAL_NVM_SIZE={nvm_size}")
+    if nvm_size > 0:
+        circuitpython_flags.append("-DCIRCUITPY_INTERNAL_NVM_START_ADDR=0")
 
     for mpflag in MPCONFIG_FLAGS:
         enabled = mpflag in DEFAULT_MODULES
         circuitpython_flags.append(f"-DCIRCUITPY_{mpflag.upper()}={1 if enabled else 0}")
 
+    # ulab is on by default and boards that cannot spare the flash set
+    # CIRCUITPY_ULAB = false in their circuitpython.toml. Flags mirror py/py.mk.
+    ulab_enabled = mpconfigboard.get("CIRCUITPY_ULAB", True)
+    circuitpython_flags.append(f"-DCIRCUITPY_ULAB={1 if ulab_enabled else 0}")
+    if ulab_enabled:
+        circuitpython_flags.extend(
+            (
+                "-DMODULE_ULAB_ENABLED=1",
+                "-DULAB_HAS_USER_MODULE=0",
+                "-iquote",
+                str(top / "extmod" / "ulab" / "code"),
+            )
+        )
+    # radio.ping() builds on Zephyr's ICMP API. On by default; boards that cannot
+    # spare the flash set CIRCUITPY_WIFI_PING = false in their circuitpython.toml
+    # and radio.ping() then reports no reply, as it does for an unreachable host.
+    circuitpython_flags.append(
+        f"-DCIRCUITPY_WIFI_PING={1 if mpconfigboard.get('CIRCUITPY_WIFI_PING', True) else 0}"
+    )
+
     source_files = supervisor_source + hal_source + ["extmod/vfs.c"]
+    if filesystem_littlefs:
+        source_files.extend(
+            (
+                "extmod/vfs_lfs.c",
+                "lib/littlefs/lfs2.c",
+                "lib/littlefs/lfs2_util.c",
+            )
+        )
+        circuitpython_flags.extend(
+            (
+                "-DLFS2_NO_MALLOC",
+                "-DLFS2_NO_DEBUG",
+                "-DLFS2_NO_WARN",
+                "-DLFS2_NO_ERROR",
+                "-DLFS2_NO_ASSERT",
+            )
+        )
+    if ulab_enabled:
+        source_files.extend(sorted((top / "extmod" / "ulab" / "code").rglob("*.c")))
     assembly_files = []
     for file in top.glob("py/*.c"):
         source_files.append(file)

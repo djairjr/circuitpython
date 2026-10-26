@@ -122,7 +122,7 @@ static mp_obj_t keypad_keymatrix_make_new(const mp_obj_type_t *type, size_t n_ar
         column_pins_array[column] = pin;
     }
 
-    keypad_keymatrix_obj_t *self = mp_obj_malloc(keypad_keymatrix_obj_t, &keypad_keymatrix_type);
+    keypad_keymatrix_obj_t *self = mp_obj_malloc_with_finaliser(keypad_keymatrix_obj_t, &keypad_keymatrix_type);
     common_hal_keypad_keymatrix_construct(self, num_row_pins, row_pins_array, num_column_pins, column_pins_array, args[ARG_columns_to_anodes].u_bool, interval, max_events, debounce_threshold);
 
     return MP_OBJ_FROM_PTR(self);
@@ -195,7 +195,7 @@ static mp_obj_t keypad_keymatrix_key_number_to_row_column(mp_obj_t self_in, mp_o
 
     const mp_uint_t key_number = (mp_uint_t)mp_arg_validate_int_range(
         mp_obj_get_int(key_number_in),
-        0, (mp_int_t)common_hal_keypad_generic_get_key_count(self),
+        0, (mp_int_t)common_hal_keypad_generic_get_key_count(self) - 1,
         MP_QSTR_key_number);
 
     mp_uint_t row;
@@ -221,10 +221,10 @@ static mp_obj_t keypad_keymatrix_row_column_to_key_number(mp_obj_t self_in, mp_o
     check_for_deinit(self);
 
     const mp_uint_t row = (mp_uint_t)mp_arg_validate_int_range(
-        mp_obj_get_int(row_in), 0, (mp_int_t)common_hal_keypad_keymatrix_get_row_count(self), MP_QSTR_row);
+        mp_obj_get_int(row_in), 0, (mp_int_t)common_hal_keypad_keymatrix_get_row_count(self) - 1, MP_QSTR_row);
 
     const mp_int_t column = (mp_uint_t)mp_arg_validate_int_range(
-        mp_obj_get_int(column_in), 0, (mp_int_t)common_hal_keypad_keymatrix_get_column_count(self), MP_QSTR_column);
+        mp_obj_get_int(column_in), 0, (mp_int_t)common_hal_keypad_keymatrix_get_column_count(self) - 1, MP_QSTR_column);
 
     return MP_OBJ_NEW_SMALL_INT(
         (mp_int_t)common_hal_keypad_keymatrix_row_column_to_key_number(self, row, column));
@@ -239,6 +239,7 @@ MP_DEFINE_CONST_FUN_OBJ_3(keypad_keymatrix_row_column_to_key_number_obj, keypad_
 
 static const mp_rom_map_elem_t keypad_keymatrix_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_deinit),                   MP_ROM_PTR(&keypad_keymatrix_deinit_obj) },
+    { MP_ROM_QSTR(MP_QSTR___del__), MP_ROM_PTR(&keypad_keymatrix_deinit_obj) },
     { MP_ROM_QSTR(MP_QSTR___enter__),                MP_ROM_PTR(&default___enter___obj) },
     { MP_ROM_QSTR(MP_QSTR___exit__),                 MP_ROM_PTR(&default___exit___obj) },
 

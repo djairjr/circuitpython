@@ -120,8 +120,13 @@ static void stream_set_blocking(audiomp3_mp3file_obj_t *self, bool block_ok) {
  * Sets self->eof if any read of the file returns 0 bytes
  */
 static bool mp3file_update_inbuf_always(audiomp3_mp3file_obj_t *self, bool block_ok) {
+    // Every return from this function must be preceded by background_callback_allow();
+    background_callback_prevent();
+
     if (self->eof || INPUT_BUFFER_SPACE(self->inbuf) == 0) {
-        return INPUT_BUFFER_AVAILABLE(self->inbuf) > 0;
+        bool result = INPUT_BUFFER_AVAILABLE(self->inbuf) > 0;
+        background_callback_allow();
+        return result;
     }
 
     stream_set_blocking(self, block_ok);
@@ -135,7 +140,8 @@ static bool mp3file_update_inbuf_always(audiomp3_mp3file_obj_t *self, bool block
         self->inbuf.read_off = 0;
     }
 
-    for (size_t to_read; !self->eof && (to_read = INPUT_BUFFER_SPACE(self->inbuf)) > 0;) {
+    for (size_t to_read; !self->eof && INPUT_BUFFER_SPACE(self->inbuf) > 0 &&
+         (to_read = (size_t)INPUT_BUFFER_SPACE(self->inbuf)) > 0;) {
         uint8_t *write_ptr = self->inbuf.buf + self->inbuf.write_off;
         ssize_t n_read = stream_read(self->stream, write_ptr, to_read);
 
@@ -145,6 +151,7 @@ static bool mp3file_update_inbuf_always(audiomp3_mp3file_obj_t *self, bool block
                 break;
             }
             self->eof = true;
+            background_callback_allow();
             mp_raise_OSError(errcode);
         }
 
@@ -160,7 +167,10 @@ static bool mp3file_update_inbuf_always(audiomp3_mp3file_obj_t *self, bool block
     }
 
     // Return true iff there are at least some useful bytes in the buffer
-    return INPUT_BUFFER_AVAILABLE(self->inbuf) > 0;
+    bool result = INPUT_BUFFER_AVAILABLE(self->inbuf) > 0;
+
+    background_callback_allow();
+    return result;
 }
 
 /** Update the inbuf from a background callback.
@@ -234,7 +244,8 @@ static void mp3file_skip_id3v2(audiomp3_mp3file_obj_t *self, bool block_ok) {
     size -= to_consume;
 
     // Next, seek in the file after the header
-    if (stream_lseek(self->stream, SEEK_CUR, size) == 0) {
+    off_t before = stream_lseek(self->stream, 0, SEEK_CUR);
+    if (before >= 0 && stream_lseek(self->stream, size, SEEK_CUR) == before + size) {
         return;
     }
 
@@ -414,7 +425,7 @@ void audiomp3_mp3file_reset_buffer(audiomp3_mp3file_obj_t *self,
     // We don't reset the buffer index in case we're looping and we have an odd number of buffer
     // loads
     background_callback_prevent();
-    if (self->eof && stream_lseek(self->stream, SEEK_SET, 0) == 0) {
+    if (self->eof && stream_lseek(self->stream, 0, SEEK_SET) == 0) {
         INPUT_BUFFER_CLEAR(self->inbuf);
         self->eof = 0;
         self->samples_decoded = 0;
@@ -481,8 +492,9 @@ audioio_get_buffer_result_t audiomp3_mp3file_get_buffer(audiomp3_mp3file_obj_t *
         if (self->eof || (err != ERR_MP3_INDATA_UNDERFLOW && err != ERR_MP3_MAINDATA_UNDERFLOW)) {
             memset(buffer, 0, self->base.max_buffer_length);
             *buffer_length = 0;
+            bool underflow = (err == ERR_MP3_INDATA_UNDERFLOW || err == ERR_MP3_MAINDATA_UNDERFLOW);
             self->eof = true;
-            return GET_BUFFER_ERROR;
+            return underflow ? GET_BUFFER_DONE : GET_BUFFER_ERROR;
         }
     }
 
@@ -507,14 +519,14 @@ audioio_get_buffer_result_t audiomp3_mp3file_get_buffer(audiomp3_mp3file_obj_t *
     return result;
 }
 
-float common_hal_audiomp3_mp3file_get_rms_level(audiomp3_mp3file_obj_t *self) {
-    float sumsq = 0.f;
+mp_float_t common_hal_audiomp3_mp3file_get_rms_level(audiomp3_mp3file_obj_t *self) {
+    mp_float_t sumsq = MICROPY_FLOAT_CONST(0.0);
     // Assumes no DC component to the audio.  Is that a safe assumption?
     int16_t *buffer = (int16_t *)(void *)self->pcm_buffer[self->buffer_index];
     for (size_t i = 0; i < self->base.max_buffer_length / sizeof(int16_t); i++) {
-        sumsq += (float)buffer[i] * buffer[i];
+        sumsq += (mp_float_t)buffer[i] * buffer[i];
     }
-    return sqrtf(sumsq) / (self->base.max_buffer_length / sizeof(int16_t));
+    return MICROPY_FLOAT_C_FUN(sqrt)(sumsq) / (self->base.max_buffer_length / sizeof(int16_t));
 }
 
 uint32_t common_hal_audiomp3_mp3file_get_samples_decoded(audiomp3_mp3file_obj_t *self) {

@@ -20,9 +20,11 @@
 
 static uint32_t yasmarang_pad = 0xeda4baba, yasmarang_n = 69, yasmarang_d = 233;
 static uint8_t yasmarang_dat = 0;
+static bool yasmarang_seeded = false;
 
 static uint32_t yasmarang(void) {
-    if (yasmarang_pad == 0xeda4baba) {
+    if (!yasmarang_seeded) {
+        yasmarang_seeded = true;
         if (!common_hal_os_urandom((uint8_t *)&yasmarang_pad, sizeof(uint32_t))) {
             yasmarang_pad = common_hal_time_monotonic_ms() & 0xffffffff;
         }
@@ -57,6 +59,7 @@ void shared_modules_random_seed(mp_uint_t seed) {
     yasmarang_n = 69;
     yasmarang_d = 233;
     yasmarang_dat = 0;
+    yasmarang_seeded = true;
 }
 
 mp_uint_t shared_modules_random_getrandbits(uint8_t n) {
@@ -77,6 +80,16 @@ mp_int_t shared_modules_random_randrange(mp_int_t start, mp_int_t stop, mp_int_t
         n = (stop - start + step + 1) / step;
     }
     return start + step * yasmarang_randbelow(n);
+}
+
+mp_int_t shared_modules_random_randint(mp_int_t a, mp_int_t b) {
+    // Compute the span unsigned so that b - a + 1 cannot overflow for any a <= b.
+    mp_uint_t n = (mp_uint_t)b - (mp_uint_t)a + 1;
+    if (n == 0) {
+        // a and b cover the full mp_int_t range: any value is in range.
+        return a + (mp_int_t)yasmarang();
+    }
+    return a + yasmarang_randbelow(n);
 }
 
 // returns a number in the range [0..1) using Yasmarang to fill in the fraction bits

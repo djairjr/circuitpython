@@ -29,10 +29,6 @@
 #include "shared-bindings/_bleio/ScanEntry.h"
 #include "shared-bindings/time/__init__.h"
 
-#if CIRCUITPY_SETTINGS_TOML
-#include "shared-bindings/os/__init__.h"
-#endif
-
 #define MSEC_TO_UNITS(TIME, RESOLUTION) (((TIME) * 1000) / (RESOLUTION))
 #define SEC_TO_UNITS(TIME, RESOLUTION) (((TIME) * 1000000) / (RESOLUTION))
 #define UNITS_TO_SEC(TIME, RESOLUTION) (((TIME)*(RESOLUTION)) / 1000000)
@@ -164,6 +160,13 @@ static void check_enabled(bleio_adapter_obj_t *adapter) {
     }
 }
 
+// A controller that supports extended advertising refuses legacy advertising
+// commands (Command Disallowed) once any extended command has been sent, so
+// use the extended command set exclusively on such controllers.
+static bool adapter_uses_extended_advertising(bleio_adapter_obj_t *adapter) {
+    return BT_FEAT_LE_EXT_ADV(adapter->features);
+}
+
 // static bool adapter_on_ble_evt(ble_evt_t *ble_evt, void *self_in) {
 //     bleio_adapter_obj_t *self = (bleio_adapter_obj_t*)self_in;
 
@@ -247,9 +250,6 @@ static void check_enabled(bleio_adapter_obj_t *adapter) {
 //     return true;
 // }
 
-// Includes trailing null.
-char default_ble_name[] = { 'C', 'I', 'R', 'C', 'U', 'I', 'T', 'P', 'Y', 0, 0, 0, 0, 0};
-
 static void _adapter_set_name(bleio_adapter_obj_t *self, mp_obj_str_t *name_obj) {
     mp_buffer_info_t bufinfo;
     mp_get_buffer_raise(name_obj, &bufinfo, MP_BUFFER_READ);
@@ -261,29 +261,7 @@ static void _adapter_set_name(bleio_adapter_obj_t *self, mp_obj_str_t *name_obj)
 static void bleio_adapter_hci_init(bleio_adapter_obj_t *self) {
     self->name = NULL;
 
-    mp_int_t name_len = 0;
-
-    #if CIRCUITPY_SETTINGS_TOML
-    mp_obj_t name = common_hal_os_getenv("CIRCUITPY_BLE_NAME", mp_const_none);
-    if (name != mp_const_none) {
-        mp_arg_validate_type_string(name, MP_QSTR_CIRCUITPY_BLE_NAME);
-        self->name = name;
-    }
-    #endif
-
-    if (!self->name) {
-        name_len = sizeof(default_ble_name) - 1;
-        bt_addr_t addr;
-        hci_check_error(hci_read_bd_addr(&addr));
-
-        default_ble_name[name_len - 4] = nibble_to_hex_lower[addr.val[1] >> 4 & 0xf];
-        default_ble_name[name_len - 3] = nibble_to_hex_lower[addr.val[1] & 0xf];
-        default_ble_name[name_len - 2] = nibble_to_hex_lower[addr.val[0] >> 4 & 0xf];
-        default_ble_name[name_len - 1] = nibble_to_hex_lower[addr.val[0] & 0xf];
-        // default_ble_name[name_len] will be zero.
-        self->name = mp_obj_new_str(default_ble_name, (uint8_t)name_len);
-    }
-    _adapter_set_name(self, self->name);
+    bleio_adapter_reset_name(self);
 
     // Get version information.
     if (hci_read_local_version(&self->hci_version, &self->hci_revision, &self->lmp_version,
@@ -325,17 +303,6 @@ static void bleio_adapter_hci_init(bleio_adapter_obj_t *self) {
         self->max_acl_buffer_len = acl_max_len;
         self->max_acl_num_buffers = acl_max_num;
     }
-
-    // Get max advertising length if extended advertising is supported.
-    if (BT_FEAT_LE_EXT_ADV(self->features)) {
-        uint16_t max_adv_data_len;
-        if (hci_le_read_maximum_advertising_data_length(&max_adv_data_len) != HCI_OK) {
-            mp_raise_bleio_BluetoothError(MP_ERROR_TEXT("Could not get max advertising length"));
-        }
-        self->max_adv_data_len = max_adv_data_len;
-    } else {
-        self->max_adv_data_len = MAX_ADVERTISEMENT_SIZE;
-    }
 }
 
 void common_hal_bleio_adapter_construct_hci_uart(bleio_adapter_obj_t *self, busio_uart_obj_t *uart, digitalio_digitalinout_obj_t *rts, digitalio_digitalinout_obj_t *cts) {
@@ -372,7 +339,6 @@ void common_hal_bleio_adapter_set_enabled(bleio_adapter_obj_t *self, bool enable
     // Enabling or disabling: stop any current activity; reset to known state.
     hci_reset();
     self->now_advertising = false;
-    self->extended_advertising = false;
     self->circuitpython_advertising = false;
     self->advertising_timeout_msecs = 0;
 
@@ -396,18 +362,14 @@ bleio_address_obj_t *common_hal_bleio_adapter_get_address(bleio_adapter_obj_t *s
     bt_addr_t addr;
     hci_check_error(hci_read_bd_addr(&addr));
 
-    bleio_address_obj_t *address = mp_obj_malloc(bleio_address_obj_t, &bleio_address_type);
-
-    common_hal_bleio_address_construct(address, addr.val, BT_ADDR_LE_PUBLIC);
-    return address;
+    // The cached address is refreshed on every call.
+    common_hal_bleio_address_construct(&self->address, addr.val, BT_ADDR_LE_PUBLIC);
+    self->address.base.type = &bleio_address_type;
+    return &self->address;
 }
 
 bool common_hal_bleio_adapter_set_address(bleio_adapter_obj_t *self, bleio_address_obj_t *address) {
-    mp_buffer_info_t bufinfo;
-    if (!mp_get_buffer(address->bytes, &bufinfo, MP_BUFFER_READ)) {
-        return false;
-    }
-    return hci_le_set_random_address(bufinfo.buf) == HCI_OK;
+    return hci_le_set_random_address(address->bytes) == HCI_OK;
 }
 
 mp_obj_str_t *common_hal_bleio_adapter_get_name(bleio_adapter_obj_t *self) {
@@ -662,26 +624,21 @@ uint32_t _common_hal_bleio_adapter_start_advertising(bleio_adapter_obj_t *self,
 
     // Copy peer address, if supplied.
     if (directed_to) {
-        mp_buffer_info_t bufinfo;
-        if (mp_get_buffer(directed_to->bytes, &bufinfo, MP_BUFFER_READ)) {
-            peer_addr.type = directed_to->type;
-            memcpy(&peer_addr.a.val, bufinfo.buf, sizeof(peer_addr.a.val));
-        }
+        peer_addr.type = directed_to->type;
+        memcpy(&peer_addr.a.val, directed_to->bytes, sizeof(peer_addr.a.val));
     }
 
-    bool extended =
-        advertising_data_len > self->max_adv_data_len || scan_response_data_len > self->max_adv_data_len;
-
-    if (extended) {
-        if (!BT_FEAT_LE_EXT_ADV(self->features)) {
-            mp_raise_bleio_BluetoothError(MP_ERROR_TEXT("Data length needs extended advertising, but this adapter does not support it"));
-        }
-
-        uint16_t props = 0;
+    if (adapter_uses_extended_advertising(self)) {
+        // Use legacy PDUs (ADV_IND etc.) so that 4.x centrals still see us and the
+        // 31-byte data limit applies unchanged; only the HCI command set is extended.
+        uint16_t props = BT_HCI_LE_ADV_PROP_LEGACY;
         if (connectable) {
-            props |= BT_HCI_LE_ADV_PROP_CONN;
-        }
-        if (scan_response_data_len > 0) {
+            if (directed_to) {
+                props |= BT_HCI_LE_ADV_PROP_CONN | BT_HCI_LE_ADV_PROP_DIRECT;
+            } else {
+                props |= BT_HCI_LE_ADV_PROP_CONN | BT_HCI_LE_ADV_PROP_SCAN;
+            }
+        } else if (scan_response_data_len > 0) {
             props |= BT_HCI_LE_ADV_PROP_SCAN;
         }
 
@@ -696,32 +653,53 @@ uint32_t _common_hal_bleio_adapter_start_advertising(bleio_adapter_obj_t *self,
                 interval_units, // max interval
                 0b111,          // channel map: channels 37, 38, 39
                 anonymous ? BT_ADDR_LE_RANDOM : BT_ADDR_LE_PUBLIC,
-                &peer_addr,    // peer_addr,
+                &peer_addr,
                 0x00,           // filter policy: no filter
-                DEFAULT_TX_POWER,
-                BT_HCI_LE_EXT_SCAN_PHY_1M, // Secondary PHY to use
-                0x00,                      // AUX_ADV_IND shall be sent prior to next adv event
-                BT_HCI_LE_EXT_SCAN_PHY_1M, // Secondary PHY to use
-                0x00,                      // Advertising SID
-                0x00                       // Scan req notify disable
+                BT_HCI_LE_ADV_TX_POWER_NO_PREF,
+                BT_HCI_LE_EXT_SCAN_PHY_1M, // primary PHY
+                0x00,                      // secondary max skip (unused with legacy PDUs)
+                BT_HCI_LE_EXT_SCAN_PHY_1M, // secondary PHY (unused with legacy PDUs)
+                0x00,                      // advertising SID
+                0x00                       // scan request notification disabled
                 ));
 
-        // We can use the duration mechanism provided, instead of our own.
-        self->advertising_timeout_msecs = 0;
+        hci_check_error(
+            hci_le_set_extended_advertising_data(
+                0,                                  // handle
+                BT_HCI_LE_EXT_ADV_OP_COMPLETE_DATA,
+                BT_HCI_LE_EXT_ADV_FRAG_DISABLED,
+                advertising_data_len,
+                (uint8_t *)advertising_data));
 
+        // A scannable set must have scan response data defined before it is enabled,
+        // even if that data is empty.
+        if (props & BT_HCI_LE_ADV_PROP_SCAN) {
+            hci_check_error(
+                hci_le_set_extended_scan_response_data(
+                    0,                                  // handle
+                    BT_HCI_LE_EXT_ADV_OP_COMPLETE_DATA,
+                    BT_HCI_LE_EXT_ADV_FRAG_DISABLED,
+                    scan_response_data_len,
+                    (uint8_t *)scan_response_data));
+        }
+
+        // Use our own timeout rather than the controller's duration, so that we don't
+        // depend on receiving the LE Advertising Set Terminated event.
+        self->advertising_timeout_msecs = timeout * 1000;
+        self->advertising_start_ticks = supervisor_ticks_ms64();
+
+        // Duration 0 and max events 0 mean "advertise until disabled by the host".
         uint8_t handle[1] = { 0 };
-        uint16_t duration_10msec[1] = { timeout * 100 };
+        uint16_t duration_forever[1] = { 0 };
         uint8_t max_ext_adv_evts[1] = { 0 };
         hci_check_error(
             hci_le_set_extended_advertising_enable(
                 BT_HCI_LE_ADV_ENABLE,
                 1,                // one advertising set.
                 handle,
-                duration_10msec,
+                duration_forever,
                 max_ext_adv_evts
                 ));
-
-        self->extended_advertising = true;
     } else {
         // Legacy advertising (not extended).
 
@@ -768,7 +746,6 @@ uint32_t _common_hal_bleio_adapter_start_advertising(bleio_adapter_obj_t *self,
 
         // Start advertising.
         hci_check_error(hci_le_set_advertising_enable(BT_HCI_LE_ADV_ENABLE));
-        self->extended_advertising = false;
     } // end legacy advertising setup
 
     vm_used_ble = true;
@@ -826,10 +803,18 @@ void common_hal_bleio_adapter_stop_advertising(bleio_adapter_obj_t *self) {
     check_enabled(self);
 
     self->now_advertising = false;
-    self->extended_advertising = false;
     self->circuitpython_advertising = false;
 
-    int result = hci_le_set_advertising_enable(BT_HCI_LE_ADV_DISABLE);
+    int result;
+    if (adapter_uses_extended_advertising(self)) {
+        // Duration and max events are ignored when disabling.
+        uint8_t handle[1] = { 0 };
+        uint16_t duration_forever[1] = { 0 };
+        uint8_t max_ext_adv_evts[1] = { 0 };
+        result = hci_le_set_extended_advertising_enable(BT_HCI_LE_ADV_DISABLE, 1, handle, duration_forever, max_ext_adv_evts);
+    } else {
+        result = hci_le_set_advertising_enable(BT_HCI_LE_ADV_DISABLE);
+    }
     // OK if we're already stopped. There seems to be an ESP32 HCI bug:
     // If advertising is already off, then LE_SET_ADV_ENABLE does not return a response.
     if (result != HCI_RESPONSE_TIMEOUT) {
@@ -843,7 +828,6 @@ void common_hal_bleio_adapter_stop_advertising(bleio_adapter_obj_t *self) {
 // Don't ask the adapter to stop.
 void bleio_adapter_advertising_was_stopped(bleio_adapter_obj_t *self) {
     self->now_advertising = false;
-    self->extended_advertising = false;
     self->circuitpython_advertising = false;
 }
 

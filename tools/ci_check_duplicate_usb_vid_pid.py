@@ -49,6 +49,9 @@ DEFAULT_CLUSTERLIST = {
     "0x239A:0x8023": ["feather_m0_express", "feather_m0_supersized"],
     "0x239A:0x80A6": ["espressif_esp32s2_devkitc_1_n4r2", "espressif_saola_1_wrover"],
     "0x239A:0x80AC": ["unexpectedmaker_feathers2", "unexpectedmaker_feathers2_prerelease"],
+    "0x303A:0x80D1": ["unexpectedmaker_tinys3", "unexpectedmaker_tinys3d"],
+    "0x303A:0x80D4": ["unexpectedmaker_pros3", "unexpectedmaker_pros3d"],
+    "0x303A:0x80D7": ["unexpectedmaker_feathers3", "unexpectedmaker_feathers3d"],
     "0x239A:0x80C8": ["espressif_kaluga_1", "espressif_kaluga_1.3"],
     "0x303A:0x7003": [
         "espressif_esp32s3_devkitc_1_n8",
@@ -58,6 +61,7 @@ DEFAULT_CLUSTERLIST = {
         "espressif_esp32s3_devkitc_1_n8r8_hacktablet",
         "espressif_esp32s3_devkitc_1_n16",
         "espressif_esp32s3_devkitc_1_n32r8",
+        "espressif_esp32s3_devkitc_1_n32r16",
     ],
     "0x303A:0x7009": [
         "espressif_esp32s2_devkitc_1_n4",
@@ -118,10 +122,6 @@ def check_vid_pid(files, clusterlist):
         creation = CREATION_PATTERN.search(src_text)
         non_usb = usb_pattern.search(src_text)
         board_name = board_config.parts[-2]
-        port_name = board_config.parts[-4]
-
-        if port_name == "renode":
-            continue
 
         if usb_vid and usb_pid:
             id_group = f"0x{int(usb_vid.group(1), 16):04X}:0x{int(usb_pid.group(1), 16):04X}"

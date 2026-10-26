@@ -31,7 +31,7 @@ sample = audiocore.RawSample(
     channel_count=2,
 )
 
-dac = board.I2S0()
+dac = board.I2SOUT()
 print("playing")
 dac.play(sample, loop=True)
 time.sleep(0.5)
@@ -134,7 +134,7 @@ sample = audiocore.RawSample(
     channel_count=2,
 )
 
-dac = board.I2S0()
+dac = board.I2SOUT()
 dac.play(sample, loop=True)
 print("playing")
 time.sleep(0.2)
@@ -144,7 +144,7 @@ print("exiting")
 
 
 @pytest.mark.duration(15)
-@pytest.mark.code_py_runs(2)
+@pytest.mark.port_resets(3)
 @pytest.mark.circuitpy_drive({"code.py": I2S_PLAY_NO_STOP_CODE})
 def test_i2s_stops_on_code_exit(circuitpython):
     """Test I2S is stopped by reset_port when code.py exits without explicit stop."""
@@ -183,7 +183,7 @@ sample = audiocore.RawSample(
     channel_count=2,
 )
 
-dac = board.I2S0()
+dac = board.I2SOUT()
 dac.play(sample, loop=True)
 print("playing")
 time.sleep(0.2)
@@ -243,7 +243,7 @@ sample = audiocore.RawSample(
     channel_count=2,
 )
 
-dac = board.I2S0()
+dac = board.I2SOUT()
 print("playing")
 dac.play(sample, loop=False)
 time.sleep(0.5)

@@ -29,6 +29,10 @@
 #ifndef CIRCUITPY_BOOT_BUTTON
   #if defined(CONFIG_IDF_TARGET_ESP32C2) || defined(CONFIG_IDF_TARGET_ESP32C3) || defined(CONFIG_IDF_TARGET_ESP32C6) || defined(CONFIG_IDF_TARGET_ESP32H2) || defined(CONFIG_IDF_TARGET_ESP32C61)
     #define CIRCUITPY_BOOT_BUTTON (&pin_GPIO9)
+  #elif defined(CONFIG_IDF_TARGET_ESP32C5)
+    #define CIRCUITPY_BOOT_BUTTON (&pin_GPIO28)
+  #elif defined(CONFIG_IDF_TARGET_ESP32S31)
+    #define CIRCUITPY_BOOT_BUTTON (&pin_GPIO61)
   #elif !defined(CONFIG_IDF_TARGET_ESP32)
     #define CIRCUITPY_BOOT_BUTTON (&pin_GPIO0)
   #endif
@@ -71,4 +75,10 @@ extern portMUX_TYPE background_task_mutex;
 
 #ifndef CIRCUITPY_ESP32P4_SWAP_LSFS
 #define CIRCUITPY_ESP32P4_SWAP_LSFS (0)
+#endif
+
+#if MICROPY_PERSISTENT_CODE_LOAD_NATIVE
+// Loaded native code is copied out of the GC heap into executable RAM.
+void *esp_native_code_commit(void *buf, size_t len, void *reloc);
+#define MP_PLAT_COMMIT_EXEC(buf, len, reloc) esp_native_code_commit(buf, len, reloc)
 #endif

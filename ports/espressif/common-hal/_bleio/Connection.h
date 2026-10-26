@@ -22,6 +22,11 @@
 typedef enum {
     PAIR_NOT_PAIRED,
     PAIR_WAITING,
+    // The peer is running LE Secure Connections numeric-comparison pairing and NimBLE is
+    // waiting for us to confirm the 6-digit value. Python reads it from
+    // Connection.numeric_comparison and answers with confirm_pairing(). This is a
+    // peer-driven, non-blocking path; the blocking pair() does not use it.
+    PAIR_WAITING_NUMCMP,
     PAIR_PAIRED,
 } pair_status_t;
 
@@ -31,6 +36,15 @@ typedef enum {
 typedef struct {
     uint16_t conn_handle;
     bool is_central;
+    // True if user code initiated or accepted this connection: it connected in the
+    // central role, or a central answered user code's advertising. User-owned
+    // connections are disconnected when the VM resets; the BLE workflow connection
+    // is not user-owned and stays up.
+    bool user_owned;
+    // An indication we sent from characteristic_notify_indicate() awaits its
+    // acknowledgment or timeout. NimBLE allows one outstanding indication per
+    // connection, shared across all characteristics.
+    volatile bool indicate_outstanding;
     // Remote services discovered when this peripheral is acting as a client.
     mp_obj_list_t *remote_service_list;
     // The advertising data and scan response buffers are held by us, not by the SD, so we must
@@ -40,7 +54,16 @@ typedef struct {
     // EDIV: Encrypted Diversifier: Identifies LTK during legacy pairing.
     uint16_t ediv;
     volatile pair_status_t pair_status;
-    uint8_t sec_status; // Internal security status.
+    // NimBLE status from the last BLE_GAP_EVENT_ENC_CHANGE: 0 on success, otherwise why
+    // pairing or encryption failed. Reported by pair().
+    volatile int sec_status;
+    // The 6-digit LE Secure Connections numeric-comparison value stashed by
+    // BLE_GAP_EVENT_PASSKEY_ACTION. Only valid while pair_status == PAIR_WAITING_NUMCMP.
+    volatile uint32_t pairing_numcmp;
+    // True once the link is encrypted AND authenticated against MITM (numeric comparison
+    // or passkey entry completed). A plain encrypted "Just Works" link leaves this false.
+    // Surfaced to Python as Connection.authenticated.
+    volatile bool mitm_protected;
     mp_obj_t connection_obj;
     volatile bool conn_params_updating;
     uint16_t mtu;

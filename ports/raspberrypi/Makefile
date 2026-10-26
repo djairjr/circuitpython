@@ -217,7 +217,14 @@ CFLAGS += \
 	-DPICO_NO_BI_BOOTSEL_VIA_DOUBLE_RESET=0 \
 	-DDVI_1BPP_BIT_REVERSE=0
 
-OPTIMIZATION_FLAGS ?= -O3
+# Shared IRQ handlers, counted over all IRQs: USB (2), CYW43, audio, rp2pio, PinAlarm and
+# max3421e. The SDK default of 4 is too few on Pico W boards.
+CFLAGS += -DPICO_MAX_SHARED_IRQ_HANDLERS=8
+
+# -O2 plus the two -O3 flags that measure: -funswitch-loops (16 KB) carries the sprite
+# blits, -fvect-cost-model=dynamic (4 KB) the fills and memcpy. Same speed as -O3 on both
+# cores for about 125 KB less flash. Boards may override this in mpconfigboard.mk.
+OPTIMIZATION_FLAGS ?= -O2 -funswitch-loops -fvect-cost-model=dynamic
 # TinyUSB defines
 CFLAGS += \
 	-DCFG_TUSB_OS=OPT_OS_PICO \
@@ -479,12 +486,17 @@ UF2_ID = 0xe48bff59
 # Double coprocessor is only available on the ARM core.
 DOUBLE_EABI = dcp
 INC += \
-	-isystem sdk/src/rp2_common/hardware_dcp/include/
+	-isystem sdk/src/rp2_common/hardware_dcp/include/ \
+	-isystem sdk/src/rp2_common/hardware_rosc/include/ \
+	-isystem sdk/src/rp2_common/pico_low_power/include/
 
 CFLAGS += -DPICO_RP2040=0 -DPICO_RP2350=1
 
 SRC_SDK_CHIP_VARIANT := \
+	src/common/pico_util/fixed_bitset.c \
 	src/rp2_common/hardware_powman/powman.c \
+	src/rp2_common/hardware_rosc/rosc.c \
+	src/rp2_common/pico_low_power/low_power.c \
 
 SRC_S_UPPER_CHIP_VARIANT := \
 	sdk/src/rp2_common/pico_double/double_conv_m33.S \
@@ -506,6 +518,13 @@ endif
 endif
 
 SRC_C += shared/runtime/gchelper_native.c
+
+ifeq ($(CIRCUITPY_PICOGAME),1)
+# SIO interpolator fast path for the picogame mode7 inner row (RP2040 + RP2350).
+# Portable C remains the fallback on other ports.
+SRC_C += common-hal/picogame/interp.c
+CFLAGS += -DPICOGAME_HAS_INTERP=1
+endif
 
 SRC_SDK := \
 	src/common/hardware_claim/claim.c \
@@ -564,6 +583,7 @@ $(patsubst %.c,$(BUILD)/%.o,$(SRC_SDK) $(SRC_CYW43)): CFLAGS += -Wno-missing-pro
 SRC_C += \
 	boards/$(BOARD)/board.c \
 	boards/$(BOARD)/pins.c \
+	common-hal/rtc/pico_time.c \
 	bindings/rp2pio/StateMachine.c \
 	bindings/rp2pio/__init__.c \
 	common-hal/rp2pio/StateMachine.c \
@@ -594,6 +614,11 @@ SRC_C += \
 INC += \
 	-isystem lib/Pico-PIO-USB/src
 
+ifeq ($(CIRCUITPY_USB_HOST_BULK),1)
+# Pico-PIO-USB bulk IN ring, polled from the host frame handler.
+CFLAGS += -DPIO_USB_HOST_BULK_STREAM=1
+endif
+
 # Core1 posts USB events while core0 may hold the TinyUSB queue mutex. The
 # contended wait path calls these two flash-resident SDK functions, and core1
 # must not execute from flash. Replace them with RAM-resident implementations
@@ -604,9 +629,17 @@ endif
 ifeq ($(CIRCUITPY_PICODVI),1)
 SRC_C += \
 	bindings/picodvi/__init__.c \
+	bindings/picodvi/AudioOut.c \
 	bindings/picodvi/Framebuffer.c \
 	common-hal/picodvi/__init__.c \
 	common-hal/picodvi/Framebuffer_$(CHIP_VARIANT).c \
+
+ifeq ($(CIRCUITPY_PICODVI_AUDIOOUT),1)
+SRC_C += \
+	common-hal/picodvi/AudioOut.c \
+	common-hal/picodvi/dvi_audio_packet.c \
+
+endif
 
 ifeq ($(CHIP_VARIANT),RP2040)
 SRC_PICODVI := \
@@ -684,6 +717,8 @@ CFLAGS += \
 	  -DMBEDTLS_CONFIG_FILE='"$(TOP)/lib/mbedtls_config/mbedtls_config.h"' \
 	  -DTF_PSA_CRYPTO_CONFIG_FILE='"$(TOP)/lib/mbedtls_config/tf_psa_crypto_config.h"' \
 
+# The generated bundle holds a hash of each root's subject name, not the name itself;
+# the format is described in lib/mbedtls_config/crt_bundle.c.
 $(BUILD)/x509_crt_bundle.S: $(TOP)/lib/certificates/data/roots-full.pem $(TOP)/tools/gen_crt_bundle.py
 	$(Q)$(PYTHON) $(TOP)/tools/gen_crt_bundle.py -i $< -o $@ --asm
 OBJ_MBEDTLS := $(BUILD)/x509_crt_bundle.o
@@ -718,8 +753,10 @@ CFLAGS += -I$(MBEDTLS_GEN)
 $(patsubst %.c,$(BUILD)/%.o,$(SRC_MBEDTLS)) $(OBJ_MBEDTLS): $(MBEDTLS_WRAPPERS_H)
 # Vendored third-party code, so don't hold it to CircuitPython's warning settings. The
 # unused-but-set variables are real but harmless: they are in key-exchange paths that
-# are compiled out.
+# are compiled out. gcc 15.3 reports false array-bounds errors in the inlined
+# mbedtls_xor_no_simd() in gcm.c and aes.c on RP2350.
 $(patsubst %.c,$(BUILD)/%.o,$(SRC_MBEDTLS)) $(OBJ_MBEDTLS): CFLAGS += \
+	-Wno-array-bounds \
 	-Wno-suggest-attribute=format \
 	-Wno-unused-but-set-variable
 else
@@ -741,11 +778,10 @@ endif
 
 $(patsubst %.S,$(BUILD)/%.o,$(SRC_S_UPPER)): CFLAGS += -Wno-undef
 
-# Derive the C++ flags from the C flags (mirroring the unix port) so the
-# vendored C++ translation unit picks up all the SDK include paths and defines.
-# Strip the C-only options that g++ rejects, and disable exceptions/RTTI to
-# match the firmware's constraints.
-CXXFLAGS += $(filter-out -std=gnu11 -Werror=missing-prototypes -Wold-style-definition -Wstrict-prototypes -Werror-implicit-function-declaration -Wnested-externs,$(CFLAGS)) -std=gnu++17 -fno-exceptions -fno-rtti
+# py/mkrules.mk derives CXXFLAGS from CFLAGS, which gives the vendored C++
+# translation unit the SDK include paths and defines. Only the C++-specific
+# options belong here.
+CXXFLAGS += -std=gnu++17 -fno-exceptions -fno-rtti
 
 OBJ = $(PY_O) $(SUPERVISOR_O) $(addprefix $(BUILD)/, $(SRC_C:.c=.o))
 OBJ += $(addprefix $(BUILD)/, $(SRC_SDK:.c=.o))
@@ -827,6 +863,7 @@ $(BUILD)/firmware.elf: $(OBJ) $(BOARD_LD) link-$(CHIP_VARIANT_LOWER).ld
 	$(Q)echo $(OBJ) > $(BUILD)/firmware.objs
 	$(Q)echo $(PICO_LDFLAGS) > $(BUILD)/firmware.ldflags
 	$(Q)$(CC) -o $@ $(CFLAGS) @$(BUILD)/firmware.ldflags $(LINKER_SCRIPTS) -Wl,--print-memory-usage -Wl,-Map=$@.map -Wl,-cref -Wl,--gc-sections @$(BUILD)/firmware.objs -Wl,-lc
+	$(Q)$(SIZE) $@ | $(PYTHON) $(TOP)/tools/build_memory_info.py $@.map $(BUILD)
 ifneq ($(CORE1_CHECK_ROOTS),)
 	$(STEPECHO) "CHECK core1 flash calls"
 	$(Q)$(PYTHON) $(TOP)/tools/check_core1_flash_calls.py $@ $(CORE1_CHECK_ROOTS)

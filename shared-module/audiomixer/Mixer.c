@@ -66,13 +66,13 @@ void audiomixer_mixer_reset_buffer(audiomixer_mixer_obj_t *self,
     bool single_channel_output,
     uint8_t channel) {
     for (uint8_t i = 0; i < self->voice_count; i++) {
-        common_hal_audiomixer_mixervoice_stop(self->voice[i]);
+        common_hal_audiomixer_mixervoice_reset_buffer(self->voice[i]);
     }
 }
 
 __attribute__((always_inline))
 static inline uint32_t add16signed(uint32_t a, uint32_t b) {
-    #if (defined(__ARM_ARCH_7EM__) && (__ARM_ARCH_7EM__ == 1))
+    #if defined(__ARM_FEATURE_DSP) && __ARM_FEATURE_DSP
     return __QADD16(a, b);
     #else
     uint32_t result = 0;
@@ -93,12 +93,13 @@ static inline uint32_t add16signed(uint32_t a, uint32_t b) {
 
 __attribute__((always_inline))
 static inline uint32_t mult16signed(uint32_t val, int32_t lomul, int32_t himul) {
-    #if (defined(__ARM_ARCH_7EM__) && (__ARM_ARCH_7EM__ == 1))
-    lomul <<= 16;
-    himul <<= 16;
+    #if defined(__ARM_FEATURE_DSP) && __ARM_FEATURE_DSP
+    // A level of 1.0 is 1 << 15, so shifting by 16 would overflow into the sign bit.
+    lomul <<= 15;
+    himul <<= 15;
     int32_t hi, lo;
     enum { bits = 16 }; // saturate to 16 bits
-    enum { shift = 15 }; // shift is done automatically
+    enum { shift = 14 }; // smulw shifts by 16, so 14 more gives (val * mul) >> 15
     __asm__ volatile ("smulwb %0, %1, %2" : "=r" (lo) : "r" (lomul), "r" (val));
     __asm__ volatile ("smulwt %0, %1, %2" : "=r" (hi) : "r" (himul), "r" (val));
     __asm__ volatile ("ssat %0, %1, %2, asr %3" : "=r" (lo) : "I" (bits), "r" (lo), "I" (shift));
@@ -108,9 +109,8 @@ static inline uint32_t mult16signed(uint32_t val, int32_t lomul, int32_t himul) 
     #else
     uint32_t result = 0;
     for (int8_t i = 0; i < 2; i++) {
-        float mod_mul = (float)(i ? himul : lomul) / (float)((1 << 15) - 1);
         int16_t ai = (val >> (sizeof(uint16_t) * 8 * i));
-        int32_t intermediate = (int32_t)(ai * mod_mul);
+        int32_t intermediate = (ai * (i ? himul : lomul)) >> 15;
         if (intermediate > SHRT_MAX) {
             intermediate = SHRT_MAX;
         } else if (intermediate < SHRT_MIN) {
@@ -124,7 +124,7 @@ static inline uint32_t mult16signed(uint32_t val, int32_t lomul, int32_t himul) 
 }
 
 static inline uint32_t tounsigned8(uint32_t val) {
-    #if (defined(__ARM_ARCH_7EM__) && (__ARM_ARCH_7EM__ == 1))
+    #if defined(__ARM_FEATURE_DSP) && __ARM_FEATURE_DSP
     return __UADD8(val, 0x80808080);
     #else
     return val ^ 0x80808080;
@@ -132,7 +132,7 @@ static inline uint32_t tounsigned8(uint32_t val) {
 }
 
 static inline uint32_t tounsigned16(uint32_t val) {
-    #if (defined(__ARM_ARCH_7EM__) && (__ARM_ARCH_7EM__ == 1))
+    #if defined(__ARM_FEATURE_DSP) && __ARM_FEATURE_DSP
     return __UADD16(val, 0x80008000);
     #else
     return val ^ 0x80008000;
@@ -140,7 +140,7 @@ static inline uint32_t tounsigned16(uint32_t val) {
 }
 
 static inline uint32_t tosigned16(uint32_t val) {
-    #if (defined(__ARM_ARCH_7EM__) && (__ARM_ARCH_7EM__ == 1))
+    #if defined(__ARM_FEATURE_DSP) && __ARM_FEATURE_DSP
     return __UADD16(val, 0x80008000);
     #else
     return val ^ 0x80008000;
@@ -156,7 +156,7 @@ static inline uint32_t pack8(uint32_t val) {
 }
 
 static inline uint32_t copy16lsb(uint32_t val) {
-    #if (defined(__ARM_ARCH_7EM__) && (__ARM_ARCH_7EM__ == 1))
+    #if defined(__ARM_FEATURE_DSP) && __ARM_FEATURE_DSP
     return __PKHBT(val, val, 16);
     #else
     val &= 0x0000ffff;
@@ -165,12 +165,39 @@ static inline uint32_t copy16lsb(uint32_t val) {
 }
 
 static inline uint32_t copy16msb(uint32_t val) {
-    #if (defined(__ARM_ARCH_7EM__) && (__ARM_ARCH_7EM__ == 1))
+    #if defined(__ARM_FEATURE_DSP) && __ARM_FEATURE_DSP
     return __PKHTB(val, val, 16);
     #else
     val &= 0xffff0000;
     return val | (val >> 16);
     #endif
+}
+
+// Rather than immediately changing the loudness of audio playback, we keep a separate buffer of
+// the "active" loudness and wait until we meet the conditions of a "zero crossing". A zero crossing
+// occurs when either the current value is 0 or the value changes from negative to positive or
+// vice-versa. This is detected by keeping a copy of the previous frame of audio data and checking
+// to see if the sign of the value has changed. By only changing loudness during zero crossings, we
+// avoid audible pops/clicks which can be unpleasant.
+static void assignmul(uint32_t word, uint32_t *last_word, int32_t *active_lomul, int32_t *active_himul, int32_t pending_lomul, int32_t pending_himul) {
+    // If the active loudness already matches the pending loudness, exit early.
+    if (MP_LIKELY(*active_lomul == pending_lomul) && MP_LIKELY(*active_himul == pending_himul)) {
+        return;
+    }
+
+    // Check for a zero crossing: current value is 0 or has changed sign from the previous value.
+    // We check for the sign change by bitmasking only the top bits of each 16-bit signed value
+    // packed into the 32-bit word (two's complement). If either bit doesn't match the previous
+    // value, a sign change has occurred on either the left or right channel.
+    if ((word & 0xffff0000) == 0 || (word & 0x0000ffff) == 0 || (*last_word != 0 && ((*last_word) & 0x80008000) != (word & 0x80008000))) {
+        // Copy over our pending loudness. Will cause future calls to `assignmul` to exit early.
+        *active_lomul = pending_lomul;
+        *active_himul = pending_himul;
+    } else {
+        // Update our copy of the previous word for future comparisons (an initial value of 0 is
+        // ignored).
+        *last_word = word;
+    }
 }
 
 #define ALMOST_ONE (MICROPY_FLOAT_CONST(32767.) / 32768)
@@ -232,18 +259,22 @@ static void mix_down_one_voice(audiomixer_mixer_obj_t *self,
         uint16_t left_panning_scaled = 32768, right_panning_scaled = 32768;
         if (MP_LIKELY(self->base.channel_count == 2)) {
             if (panning >= 0) {
-                left_panning_scaled = 32767 - panning;
+                left_panning_scaled = 32768 - panning;
             } else {
-                right_panning_scaled = 32767 + panning;
+                right_panning_scaled = 32768 + panning;
             }
         }
 
-        int32_t lo_level = level;
-        int32_t hi_level = level;
+        int32_t pending_lo_level = level;
+        int32_t pending_hi_level = level;
         if (MP_LIKELY(self->base.channel_count == 2)) {
-            lo_level = (left_panning_scaled * lo_level) >> 15;
-            hi_level = (right_panning_scaled * hi_level) >> 15;
+            pending_lo_level = (left_panning_scaled * pending_lo_level) >> 15;
+            pending_hi_level = (right_panning_scaled * pending_hi_level) >> 15;
         }
+
+        int32_t active_lo_level = voice->active_lo_level;
+        int32_t active_hi_level = voice->active_hi_level;
+        uint32_t last_word = 0;
 
         // First active voice gets copied over verbatim.
         if (!voices_active) {
@@ -251,29 +282,39 @@ static void mix_down_one_voice(audiomixer_mixer_obj_t *self,
                 if (MP_LIKELY(self->base.samples_signed)) {
                     if (MP_LIKELY(self->base.channel_count == sample->channel_count)) {
                         for (uint32_t i = 0; i < n; i++) {
-                            uint32_t v = src[i];
-                            word_buffer[i] = mult16signed(v, lo_level, hi_level);
+                            uint32_t word = src[i];
+                            assignmul(word, &last_word, &active_lo_level, &active_hi_level, pending_lo_level, pending_hi_level);
+                            word_buffer[i] = mult16signed(word, active_lo_level, active_hi_level);
                         }
                     } else {
-                        for (uint32_t i = 0; i < n; i += 2) {
-                            uint32_t v = src[i >> 1];
-                            word_buffer[i] = mult16signed(copy16lsb(v), lo_level, hi_level);
-                            word_buffer[i + 1] = mult16signed(copy16msb(v), lo_level, hi_level);
+                        for (uint32_t i = 0; i + 1 < n; i += 2) {
+                            uint32_t word = src[i >> 1];
+                            uint32_t word_lsb = copy16lsb(word);
+                            assignmul(word_lsb, &last_word, &active_lo_level, &active_hi_level, pending_lo_level, pending_hi_level);
+                            word_buffer[i] = mult16signed(word_lsb, active_lo_level, active_hi_level);
+                            word = copy16msb(word);
+                            assignmul(word, &last_word, &active_lo_level, &active_hi_level, pending_lo_level, pending_hi_level);
+                            word_buffer[i + 1] = mult16signed(word, active_lo_level, active_hi_level);
                         }
                     }
                 } else {
                     if (MP_LIKELY(self->base.channel_count == sample->channel_count)) {
                         for (uint32_t i = 0; i < n; i++) {
-                            uint32_t v = src[i];
-                            v = tosigned16(v);
-                            word_buffer[i] = mult16signed(v, lo_level, hi_level);
+                            uint32_t word = src[i];
+                            word = tosigned16(word);
+                            assignmul(word, &last_word, &active_lo_level, &active_hi_level, pending_lo_level, pending_hi_level);
+                            word_buffer[i] = mult16signed(word, active_lo_level, active_hi_level);
                         }
                     } else {
                         for (uint32_t i = 0; i + 1 < n; i += 2) {
-                            uint32_t v = src[i >> 1];
-                            v = tosigned16(v);
-                            word_buffer[i] = mult16signed(copy16lsb(v), lo_level, hi_level);
-                            word_buffer[i + 1] = mult16signed(copy16msb(v), lo_level, hi_level);
+                            uint32_t word = src[i >> 1];
+                            word = tosigned16(word);
+                            uint32_t word_lsb = copy16lsb(word);
+                            assignmul(word_lsb, &last_word, &active_lo_level, &active_hi_level, pending_lo_level, pending_hi_level);
+                            word_buffer[i] = mult16signed(word_lsb, active_lo_level, active_hi_level);
+                            word = copy16msb(word);
+                            assignmul(word, &last_word, &active_lo_level, &active_hi_level, pending_lo_level, pending_hi_level);
+                            word_buffer[i + 1] = mult16signed(word, active_lo_level, active_hi_level);
                         }
                     }
                 }
@@ -286,7 +327,8 @@ static void mix_down_one_voice(audiomixer_mixer_obj_t *self,
                         if (MP_LIKELY(!self->base.samples_signed)) {
                             word = tosigned16(word);
                         }
-                        word = mult16signed(word, lo_level, hi_level);
+                        assignmul(word, &last_word, &active_lo_level, &active_hi_level, pending_lo_level, pending_hi_level);
+                        word = mult16signed(word, active_lo_level, active_hi_level);
                         hword_buffer[i] = pack8(word);
                     }
                 } else {
@@ -295,8 +337,12 @@ static void mix_down_one_voice(audiomixer_mixer_obj_t *self,
                         if (MP_LIKELY(!self->base.samples_signed)) {
                             word = tosigned16(word);
                         }
-                        hword_buffer[i] = pack8(mult16signed(copy16lsb(word), lo_level, hi_level));
-                        hword_buffer[i + 1] = pack8(mult16signed(copy16msb(word), lo_level, hi_level));
+                        uint32_t word_lsb = copy16lsb(word);
+                        assignmul(word_lsb, &last_word, &active_lo_level, &active_hi_level, pending_lo_level, pending_hi_level);
+                        hword_buffer[i] = pack8(mult16signed(word_lsb, active_lo_level, active_hi_level));
+                        word = copy16msb(word);
+                        assignmul(word, &last_word, &active_lo_level, &active_hi_level, pending_lo_level, pending_hi_level);
+                        hword_buffer[i + 1] = pack8(mult16signed(word, active_lo_level, active_hi_level));
                     }
                 }
             }
@@ -306,13 +352,18 @@ static void mix_down_one_voice(audiomixer_mixer_obj_t *self,
                     if (MP_LIKELY(self->base.channel_count == sample->channel_count)) {
                         for (uint32_t i = 0; i < n; i++) {
                             uint32_t word = src[i];
-                            word_buffer[i] = add16signed(mult16signed(word, lo_level, hi_level), word_buffer[i]);
+                            assignmul(word, &last_word, &active_lo_level, &active_hi_level, pending_lo_level, pending_hi_level);
+                            word_buffer[i] = add16signed(mult16signed(word, active_lo_level, active_hi_level), word_buffer[i]);
                         }
                     } else {
                         for (uint32_t i = 0; i + 1 < n; i += 2) {
                             uint32_t word = src[i >> 1];
-                            word_buffer[i] = add16signed(mult16signed(copy16lsb(word), lo_level, hi_level), word_buffer[i]);
-                            word_buffer[i + 1] = add16signed(mult16signed(copy16msb(word), lo_level, hi_level), word_buffer[i + 1]);
+                            uint32_t word_lsb = copy16lsb(word);
+                            assignmul(word_lsb, &last_word, &active_lo_level, &active_hi_level, pending_lo_level, pending_hi_level);
+                            word_buffer[i] = add16signed(mult16signed(word_lsb, active_lo_level, active_hi_level), word_buffer[i]);
+                            word = copy16msb(word);
+                            assignmul(word, &last_word, &active_lo_level, &active_hi_level, pending_lo_level, pending_hi_level);
+                            word_buffer[i + 1] = add16signed(mult16signed(word, active_lo_level, active_hi_level), word_buffer[i + 1]);
                         }
                     }
                 } else {
@@ -320,14 +371,19 @@ static void mix_down_one_voice(audiomixer_mixer_obj_t *self,
                         for (uint32_t i = 0; i < n; i++) {
                             uint32_t word = src[i];
                             word = tosigned16(word);
-                            word_buffer[i] = add16signed(mult16signed(word, lo_level, hi_level), word_buffer[i]);
+                            assignmul(word, &last_word, &active_lo_level, &active_hi_level, pending_lo_level, pending_hi_level);
+                            word_buffer[i] = add16signed(mult16signed(word, active_lo_level, active_hi_level), word_buffer[i]);
                         }
                     } else {
                         for (uint32_t i = 0; i + 1 < n; i += 2) {
                             uint32_t word = src[i >> 1];
                             word = tosigned16(word);
-                            word_buffer[i] = add16signed(mult16signed(copy16lsb(word), lo_level, hi_level), word_buffer[i]);
-                            word_buffer[i + 1] = add16signed(mult16signed(copy16msb(word), lo_level, hi_level), word_buffer[i + 1]);
+                            uint32_t word_lsb = copy16lsb(word);
+                            assignmul(word_lsb, &last_word, &active_lo_level, &active_hi_level, pending_lo_level, pending_hi_level);
+                            word_buffer[i] = add16signed(mult16signed(word_lsb, active_lo_level, active_hi_level), word_buffer[i]);
+                            word = copy16msb(word);
+                            assignmul(word, &last_word, &active_lo_level, &active_hi_level, pending_lo_level, pending_hi_level);
+                            word_buffer[i + 1] = add16signed(mult16signed(word, active_lo_level, active_hi_level), word_buffer[i + 1]);
                         }
                     }
                 }
@@ -340,7 +396,8 @@ static void mix_down_one_voice(audiomixer_mixer_obj_t *self,
                         if (MP_LIKELY(!self->base.samples_signed)) {
                             word = tosigned16(word);
                         }
-                        word = mult16signed(word, lo_level, hi_level);
+                        assignmul(word, &last_word, &active_lo_level, &active_hi_level, pending_lo_level, pending_hi_level);
+                        word = mult16signed(word, active_lo_level, active_hi_level);
                         word = add16signed(word, unpack8(hword_buffer[i]));
                         hword_buffer[i] = pack8(word);
                     }
@@ -350,8 +407,12 @@ static void mix_down_one_voice(audiomixer_mixer_obj_t *self,
                         if (MP_LIKELY(!self->base.samples_signed)) {
                             word = tosigned16(word);
                         }
-                        hword_buffer[i] = pack8(add16signed(mult16signed(copy16lsb(word), lo_level, hi_level), unpack8(hword_buffer[i])));
-                        hword_buffer[i + 1] = pack8(add16signed(mult16signed(copy16msb(word), lo_level, hi_level), unpack8(hword_buffer[i + 1])));
+                        uint32_t word_lsb = copy16lsb(word);
+                        assignmul(word_lsb, &last_word, &active_lo_level, &active_hi_level, pending_lo_level, pending_hi_level);
+                        hword_buffer[i] = pack8(add16signed(mult16signed(word_lsb, active_lo_level, active_hi_level), unpack8(hword_buffer[i])));
+                        word = copy16msb(word);
+                        assignmul(word, &last_word, &active_lo_level, &active_hi_level, pending_lo_level, pending_hi_level);
+                        hword_buffer[i + 1] = pack8(add16signed(mult16signed(word, active_lo_level, active_hi_level), unpack8(hword_buffer[i + 1])));
                     }
                 }
             }
@@ -365,6 +426,12 @@ static void mix_down_one_voice(audiomixer_mixer_obj_t *self,
             voice->remaining_buffer += n >> 1;
             voice->buffer_length -= n >> 1;
         }
+
+        // Force the active level to match the pending level in the case that the conditions of a
+        // zero crossing weren't met within the last `SYNTHIO_MAX_DUR` frames. Will ensure minimal
+        // delay in level or panning changes at the potential expensive of an audible pop.
+        voice->active_lo_level = pending_lo_level;
+        voice->active_hi_level = pending_hi_level;
     }
 
     if (length && !voices_active) {

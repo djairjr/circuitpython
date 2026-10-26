@@ -11,42 +11,73 @@
 #include "common-hal/_bleio/Adapter.h"
 #include "common-hal/_bleio/__init__.h"
 #include "bindings/zephyr_kernel/__init__.h"
+#include "common-hal/_bleio/Connection.h"
+#include "common-hal/_bleio/Service.h"
 #include "supervisor/shared/bluetooth/bluetooth.h"
 #include "supervisor/shared/tick.h"
+
+#include <zephyr/bluetooth/att.h>
 
 // The singleton _bleio.Adapter object
 bleio_adapter_obj_t common_hal_bleio_adapter_obj;
 
+// Called once by the BLE workflow at boot and again on every `import _bleio`,
+// so it must not disturb a running adapter: the workflow may be advertising or
+// connected by the time user code imports the module. Starting the BLE stack happens in
+// common_hal_bleio_adapter_set_enabled(), which the importer calls next.
 void common_hal_bleio_init(void) {
     common_hal_bleio_adapter_obj.base.type = &bleio_adapter_type;
-    bleio_adapter_reset(&common_hal_bleio_adapter_obj);
+    bleio_connection_register_auth_callbacks();
 }
 
+// Tear down user BLE state at the end of a VM run, leaving the BLE workflow
+// connection up. Runs while the VM heap is still valid.
 void bleio_user_reset(void) {
     if (common_hal_bleio_adapter_get_enabled(&common_hal_bleio_adapter_obj)) {
         // Stop any user scanning or advertising.
         common_hal_bleio_adapter_stop_scan(&common_hal_bleio_adapter_obj);
         common_hal_bleio_adapter_stop_advertising(&common_hal_bleio_adapter_obj);
+
+        // Disconnect the connections that user code initiated or accepted with its
+        // own advertising. The BLE workflow connection is not user-owned and stays up.
+        //
+        // Clear each connection's pointer into the VM heap first: the heap is about
+        // to go away, and a disconnect completes asynchronously, possibly after the heap
+        // is gone.
+        for (size_t i = 0; i < BLEIO_TOTAL_CONNECTION_COUNT; i++) {
+            bleio_connection_internal_t *connection = &bleio_connections[i];
+            connection->connection_obj = mp_const_none;
+            if (connection->conn != NULL && connection->user_owned) {
+                common_hal_bleio_connection_disconnect(connection);
+            }
+        }
+
+        // Remove references to any VM heap objects.
+        common_hal_bleio_adapter_obj.connection_objs = NULL;
+        common_hal_bleio_adapter_obj.scan_results = NULL;
     }
+
+    // Remove user-created services from Zephyr's GATT database and free their
+    // buffers. Zephyr indicates Service Changed to connected peers itself, and
+    // records it for bonded peers to receive when they next connect.
+    bleio_service_unregister_retained();
 
     // Maybe start advertising the BLE workflow.
     supervisor_bluetooth_background();
 }
 
+// Called after the VM heap is gone. On nordic and espressif this restarts the
+// BLE stack when user code created GATT services, because their stacks can't
+// remove services one at a time. Zephyr can, and bleio_user_reset() already did,
+// so there is nothing left that requires dropping the workflow connection.
 void bleio_reset(void) {
     common_hal_bleio_adapter_obj.base.type = &bleio_adapter_type;
-    if (!common_hal_bleio_adapter_get_enabled(&common_hal_bleio_adapter_obj)) {
-        return;
-    }
-
-    supervisor_stop_bluetooth();
-    bleio_adapter_reset(&common_hal_bleio_adapter_obj);
-    common_hal_bleio_adapter_set_enabled(&common_hal_bleio_adapter_obj, false);
-    supervisor_start_bluetooth();
+    bleio_clear_user_services_created();
 }
 
 void common_hal_bleio_gc_collect(void) {
     bleio_adapter_gc_collect(&common_hal_bleio_adapter_obj);
+    bleio_service_gc_collect();
 }
 
 // =======================================================================
@@ -113,6 +144,47 @@ static void on_gattc_write(struct bt_conn *conn, uint8_t err,
     ctx->done = true;
 }
 
+// Raise an exception for a nonzero ATT error code from a GATT client read or write.
+// connected is whether the connection was still up when the request finished.
+static void check_gattc_status(bool connected, uint8_t err) {
+    if (err == 0) {
+        return;
+    }
+    // Zephyr reports local failures, including a disconnect while the request was
+    // outstanding, as BT_ATT_ERR_UNLIKELY. Check the connection before blaming the peer.
+    if (!connected) {
+        mp_raise_ConnectionError(MP_ERROR_TEXT("Not connected"));
+    }
+    switch (err) {
+        case BT_ATT_ERR_READ_NOT_PERMITTED:
+            mp_raise_bleio_BluetoothError(MP_ERROR_TEXT("%q not permitted"), MP_QSTR_read);
+            return;
+        case BT_ATT_ERR_WRITE_NOT_PERMITTED:
+            mp_raise_bleio_BluetoothError(MP_ERROR_TEXT("%q not permitted"), MP_QSTR_write);
+            return;
+        case BT_ATT_ERR_AUTHENTICATION:
+            mp_raise_bleio_SecurityError(MP_ERROR_TEXT("Insufficient authentication"));
+            return;
+        case BT_ATT_ERR_AUTHORIZATION:
+            mp_raise_bleio_SecurityError(MP_ERROR_TEXT("Insufficient authorization"));
+            return;
+        case BT_ATT_ERR_INSUFFICIENT_ENCRYPTION:
+        case BT_ATT_ERR_ENCRYPTION_KEY_SIZE:
+            mp_raise_bleio_SecurityError(MP_ERROR_TEXT("Insufficient encryption"));
+            return;
+        case BT_ATT_ERR_INVALID_ATTRIBUTE_LEN:
+            mp_arg_error_invalid(MP_QSTR_length);
+            return;
+        default:
+            mp_raise_bleio_BluetoothError(MP_ERROR_TEXT("Unknown gatt error: 0x%04x"), err);
+    }
+}
+
+static bool conn_is_connected(struct bt_conn *conn) {
+    struct bt_conn_info info;
+    return bt_conn_get_info(conn, &info) == 0 && info.state == BT_CONN_STATE_CONNECTED;
+}
+
 size_t bleio_gattc_read_sync(struct bt_conn *conn, uint16_t handle,
     uint8_t *buf, size_t len) {
     gattc_read_ctx_t ctx = {
@@ -130,9 +202,17 @@ size_t bleio_gattc_read_sync(struct bt_conn *conn, uint16_t handle,
     read_params.single.handle = handle;
     read_params.single.offset = 0;
 
+    // `bt_conn_ref()` holds a reference to the connection, so conn stays valid until
+    // its state is checked below, even if a disconnect drops the connection's own
+    // reference meanwhile. It returns NULL if the peer has already disconnected.
+    if (bt_conn_ref(conn) == NULL) {
+        active_read_ctx = NULL;
+        mp_raise_ConnectionError(MP_ERROR_TEXT("Not connected"));
+    }
     int err = bt_gatt_read(conn, &read_params);
     if (err != 0) {
         active_read_ctx = NULL;
+        bt_conn_unref(conn);
         raise_zephyr_error(err);
     }
 
@@ -141,9 +221,9 @@ size_t bleio_gattc_read_sync(struct bt_conn *conn, uint16_t handle,
     }
     active_read_ctx = NULL;
 
-    if (ctx.err != 0) {
-        raise_zephyr_error(ctx.err);
-    }
+    bool connected = conn_is_connected(conn);
+    bt_conn_unref(conn);
+    check_gattc_status(connected, ctx.err);
 
     return ctx.read_len;
 }
@@ -163,9 +243,17 @@ void bleio_gattc_write_sync(struct bt_conn *conn, uint16_t handle,
     write_params.data = data;
     write_params.length = len;
 
+    // `bt_conn_ref()` holds a reference to the connection, so conn stays valid until
+    // its state is checked below, even if a disconnect drops the connection's own
+    // reference meanwhile. It returns NULL if the peer has already disconnected.
+    if (bt_conn_ref(conn) == NULL) {
+        active_write_ctx = NULL;
+        mp_raise_ConnectionError(MP_ERROR_TEXT("Not connected"));
+    }
     int err = bt_gatt_write(conn, &write_params);
     if (err != 0) {
         active_write_ctx = NULL;
+        bt_conn_unref(conn);
         raise_zephyr_error(err);
     }
 
@@ -174,7 +262,7 @@ void bleio_gattc_write_sync(struct bt_conn *conn, uint16_t handle,
     }
     active_write_ctx = NULL;
 
-    if (ctx.err != 0) {
-        raise_zephyr_error(ctx.err);
-    }
+    bool connected = conn_is_connected(conn);
+    bt_conn_unref(conn);
+    check_gattc_status(connected, ctx.err);
 }

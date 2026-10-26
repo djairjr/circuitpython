@@ -73,7 +73,7 @@ static mp_obj_t digitalio_digitalinout_make_new(const mp_obj_type_t *type,
 
     const mcu_pin_obj_t *pin = common_hal_digitalio_validate_pin(args[0]);
 
-    digitalio_digitalinout_obj_t *self = mp_obj_malloc(digitalio_digitalinout_obj_t, &digitalio_digitalinout_type);
+    digitalio_digitalinout_obj_t *self = mp_obj_malloc_with_finaliser(digitalio_digitalinout_obj_t, &digitalio_digitalinout_type);
     common_hal_digitalio_digitalinout_construct(self, pin);
 
     return MP_OBJ_FROM_PTR(self);
@@ -134,6 +134,8 @@ static mp_obj_t digitalio_digitalinout_switch_to_output(size_t n_args, const mp_
     digitalio_drive_mode_t drive_mode = DRIVE_MODE_PUSH_PULL;
     if (args[ARG_drive_mode].u_rom_obj == MP_ROM_PTR(&digitalio_drive_mode_open_drain_obj)) {
         drive_mode = DRIVE_MODE_OPEN_DRAIN;
+    } else if (args[ARG_drive_mode].u_rom_obj != MP_ROM_PTR(&digitalio_drive_mode_push_pull_obj)) {
+        mp_arg_error_invalid(MP_QSTR_drive_mode);
     }
     // do the transfer
     check_result(common_hal_digitalio_digitalinout_switch_to_output(self, args[ARG_value].u_bool, drive_mode));
@@ -271,6 +273,8 @@ static mp_obj_t digitalio_digitalinout_obj_set_drive_mode(mp_obj_t self_in, mp_o
     digitalio_drive_mode_t c_drive_mode = DRIVE_MODE_PUSH_PULL;
     if (drive_mode == MP_ROM_PTR(&digitalio_drive_mode_open_drain_obj)) {
         c_drive_mode = DRIVE_MODE_OPEN_DRAIN;
+    } else if (drive_mode != MP_ROM_PTR(&digitalio_drive_mode_push_pull_obj)) {
+        mp_arg_error_invalid(MP_QSTR_drive_mode);
     }
     check_result(common_hal_digitalio_digitalinout_set_drive_mode(self, c_drive_mode));
     return mp_const_none;
@@ -328,6 +332,7 @@ MP_PROPERTY_GETSET(digitalio_digitalio_pull_obj,
 static const mp_rom_map_elem_t digitalio_digitalinout_locals_dict_table[] = {
     // instance methods
     { MP_ROM_QSTR(MP_QSTR_deinit),             MP_ROM_PTR(&digitalio_digitalinout_deinit_obj) },
+    { MP_ROM_QSTR(MP_QSTR___del__), MP_ROM_PTR(&digitalio_digitalinout_deinit_obj) },
     { MP_ROM_QSTR(MP_QSTR___enter__),          MP_ROM_PTR(&default___enter___obj) },
     { MP_ROM_QSTR(MP_QSTR___exit__),           MP_ROM_PTR(&default___exit___obj) },
     { MP_ROM_QSTR(MP_QSTR_switch_to_output),   MP_ROM_PTR(&digitalio_digitalinout_switch_to_output_obj) },

@@ -48,7 +48,7 @@ void shared_module_bitbangio_spi_construct(bitbangio_spi_obj_t *self,
 }
 
 bool shared_module_bitbangio_spi_deinited(bitbangio_spi_obj_t *self) {
-    return digitalinout_protocol_deinited(self->clock);
+    return self->clock == MP_OBJ_NULL;
 }
 
 void shared_module_bitbangio_spi_deinit(bitbangio_spi_obj_t *self) {
@@ -68,6 +68,8 @@ void shared_module_bitbangio_spi_deinit(bitbangio_spi_obj_t *self) {
         digitalinout_protocol_deinit(self->miso);
         circuitpy_free_obj(self->miso);
     }
+    // Mark deinited; the pin objects may have been freed above.
+    self->clock = MP_OBJ_NULL;
 }
 
 void shared_module_bitbangio_spi_configure(bitbangio_spi_obj_t *self,
@@ -145,7 +147,7 @@ bool shared_module_bitbangio_spi_write(bitbangio_spi_obj_t *self, const uint8_t 
         uint8_t data_out = data[i];
         for (int j = 0; j < 8; ++j, data_out <<= 1) {
             if (i == 0 && j == 0) {
-                if (!digitalinout_protocol_set_value(self->mosi, (data_out >> 7) & 1)) {
+                if (digitalinout_protocol_set_value(self->mosi, (data_out >> 7) & 1) != 0) {
                     return false;
                 }
             } else {
@@ -209,7 +211,7 @@ bool shared_module_bitbangio_spi_read(bitbangio_spi_obj_t *self, uint8_t *data, 
     }
     #endif
     if (self->has_mosi) {
-        if (!digitalinout_protocol_set_value(self->mosi, false)) {
+        if (digitalinout_protocol_set_value(self->mosi, false) != 0) {
             return false;
         }
     }
@@ -298,7 +300,7 @@ bool shared_module_bitbangio_spi_transfer(bitbangio_spi_obj_t *self, const uint8
         uint8_t data_in = 0;
         for (int j = 0; j < 8; ++j, data_out <<= 1) {
             if (i == 0 && j == 0) {
-                if (!digitalinout_protocol_set_value(self->mosi, (data_out >> 7) & 1)) {
+                if (digitalinout_protocol_set_value(self->mosi, (data_out >> 7) & 1) != 0) {
                     return false;
                 }
             } else {

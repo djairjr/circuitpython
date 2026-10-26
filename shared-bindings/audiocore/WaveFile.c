@@ -12,7 +12,7 @@
 #include "shared-bindings/audiocore/WaveFile.h"
 #include "shared-bindings/audiocore/__init__.h"
 #include "shared-bindings/util.h"
-#include "extmod/vfs_posix.h"
+#include "extmod/vfs.h"
 
 //| class WaveFile:
 //|     """Load a wave file for audio playback
@@ -27,7 +27,8 @@
 //|         :param Union[str, typing.BinaryIO] file: The name of a wave file (preferred) or an already opened wave file
 //|         :param ~circuitpython_typing.WriteableBuffer buffer: Optional pre-allocated buffer,
 //|           that will be split in half and used for double-buffering of the data.
-//|           The buffer must be 8 to 1024 bytes long.
+//|           The buffer must be 8 to 1024 bytes long and a multiple of 8 bytes, so that each half
+//|           holds a whole number of 32-bit words.
 //|           If not provided, two 256 byte buffers are initially allocated internally.
 //|
 //|         Playing a wave file from flash::
@@ -60,9 +61,6 @@ static mp_obj_t audioio_wavefile_make_new(const mp_obj_type_t *type, size_t n_ar
         arg = mp_call_function_2(MP_OBJ_FROM_PTR(&mp_builtin_open_obj), arg, MP_ROM_QSTR(MP_QSTR_rb));
     }
 
-    if (!mp_obj_is_type(arg, &mp_type_vfs_fat_fileio)) {
-        mp_raise_TypeError(MP_ERROR_TEXT("file must be a file opened in byte mode"));
-    }
     uint8_t *buffer = NULL;
     size_t buffer_size = 0;
     if (n_args >= 2) {
@@ -70,10 +68,13 @@ static mp_obj_t audioio_wavefile_make_new(const mp_obj_type_t *type, size_t n_ar
         mp_get_buffer_raise(args[1], &bufinfo, MP_BUFFER_WRITE);
         buffer = bufinfo.buf;
         buffer_size = mp_arg_validate_length_range(bufinfo.len, 8, 1024, MP_QSTR_buffer);
+        if (buffer_size % 8 != 0) {
+            mp_raise_ValueError_varg(MP_ERROR_TEXT("Buffer must be a multiple of %d bytes"), 8);
+        }
     }
 
-    audioio_wavefile_obj_t *self = mp_obj_malloc(audioio_wavefile_obj_t, &audioio_wavefile_type);
-    common_hal_audioio_wavefile_construct(self, MP_OBJ_TO_PTR(arg),
+    audioio_wavefile_obj_t *self = mp_obj_malloc_with_finaliser(audioio_wavefile_obj_t, &audioio_wavefile_type);
+    common_hal_audioio_wavefile_construct(self, arg,
         buffer, buffer_size);
 
     return MP_OBJ_FROM_PTR(self);
@@ -119,6 +120,7 @@ static MP_DEFINE_CONST_FUN_OBJ_1(audioio_wavefile_deinit_obj, audioio_wavefile_d
 static const mp_rom_map_elem_t audioio_wavefile_locals_dict_table[] = {
     // Methods
     { MP_ROM_QSTR(MP_QSTR_deinit), MP_ROM_PTR(&audioio_wavefile_deinit_obj) },
+    { MP_ROM_QSTR(MP_QSTR___del__), MP_ROM_PTR(&audioio_wavefile_deinit_obj) },
     { MP_ROM_QSTR(MP_QSTR___enter__), MP_ROM_PTR(&default___enter___obj) },
     { MP_ROM_QSTR(MP_QSTR___exit__), MP_ROM_PTR(&default___exit___obj) },
 

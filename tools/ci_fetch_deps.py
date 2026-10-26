@@ -54,7 +54,6 @@ PORT_DEPS = {
         "lib/tlsf",
         "data/nvm.toml/",
     ],
-    "broadcom": ["extmod/ulab/", "lib/tlsf", "lib/tinyusb/"],
     "cxd56": ["extmod/ulab/", "lib/tlsf", "lib/tinyusb/"],
     "espressif": [
         "extmod/ulab/",
@@ -65,8 +64,7 @@ PORT_DEPS = {
         "lib/tlsf",
         "lib/tinyusb/",
     ],
-    "litex": ["extmod/ulab/", "lib/tinyusb/", "lib/tlsf"],
-    "mimxrt10xx": ["extmod/ulab/", "lib/tinyusb/", "lib/tlsf", "data/nvm.toml/"],
+    "mimxrt10xx": ["extmod/ulab/", "lib/mp3/", "lib/tinyusb/", "lib/tlsf", "data/nvm.toml/"],
     "nordic": [
         "extmod/ulab/",
         "lib/mbedtls/",
@@ -88,7 +86,6 @@ PORT_DEPS = {
         "lib/tlsf",
         "data/nvm.toml/",
     ],
-    "renode": ["lib/tlsf"],
     "silabs": ["extmod/ulab/", "data/nvm.toml/", "lib/tlsf"],
     "stm": [
         "extmod/ulab/",
@@ -99,7 +96,9 @@ PORT_DEPS = {
         "data/nvm.toml/",
     ],
     "zephyr-cp": [
+        "extmod/ulab/",
         "lib/certificates/",
+        "lib/mp3/",
         "lib/tinyusb/",
         "lib/tlsf",
     ],
@@ -158,6 +157,16 @@ def fetch(where):
             "Init mbedtls nested submodules",
             f"git submodule update --init {filter_maybe} {depth_maybe} tf-psa-crypto framework",
             cwd=mbedtls,
+        )
+
+    # ESP-Hosted keeps the protobuf-c runtime in a nested submodule.
+    esp_hosted = TOP / "ports" / "espressif" / "esp-hosted"
+    if (esp_hosted / ".gitmodules").exists():
+        depth_maybe = "" if clone_supports_filter else "--depth 1"
+        run(
+            "Init esp-hosted nested submodules",
+            f"git submodule update --init {filter_maybe} {depth_maybe} common/protobuf-c",
+            cwd=esp_hosted,
         )
 
 
@@ -253,6 +262,9 @@ def main(target):
                             lib_folder = lib_folder.split("/", maxsplit=2)
                             lib_folder = "/".join(lib_folder[:2])
                         submodules.append(lib_folder)
+                        # The frozen manifest build needs micropython-lib.
+                        if "lib/micropython-lib" not in submodules:
+                            submodules.append("lib/micropython-lib")
         else:
             # TODO: Add a way to specify frozen modules in circuitpython.toml
             pass

@@ -85,7 +85,7 @@ static mp_obj_t audiomixer_mixer_make_new(const mp_obj_type_t *type, size_t n_ar
         mp_raise_ValueError(MP_ERROR_TEXT("bits_per_sample must be 8 or 16"));
     }
     audiomixer_mixer_obj_t *self =
-        mp_obj_malloc_var(audiomixer_mixer_obj_t, voice, mp_obj_t, voice_count, &audiomixer_mixer_type);
+        mp_obj_malloc_var_with_finaliser(audiomixer_mixer_obj_t, voice, mp_obj_t, voice_count, &audiomixer_mixer_type);
     common_hal_audiomixer_mixer_construct(self, voice_count, args[ARG_buffer_size].u_int, bits_per_sample, args[ARG_samples_signed].u_bool, channel_count, sample_rate);
 
     for (int v = 0; v < voice_count; v++) {
@@ -185,10 +185,8 @@ static mp_obj_t audiomixer_mixer_obj_play(size_t n_args, const mp_obj_t *pos_arg
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
     mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
 
-    uint8_t v = args[ARG_voice].u_int;
-    if (v > (self->voice_count - 1)) {
-        mp_arg_error_invalid(MP_QSTR_voice);
-    }
+    uint8_t v = mp_arg_validate_int_range(args[ARG_voice].u_int, 0, self->voice_count - 1,
+        MP_QSTR_voice);
     audiomixer_mixervoice_obj_t *voice = MP_OBJ_TO_PTR(self->voice[v]);
     mp_obj_t sample = args[ARG_sample].u_obj;
     common_hal_audiomixer_mixervoice_play(voice, sample, args[ARG_loop].u_bool);
@@ -212,10 +210,8 @@ static mp_obj_t audiomixer_mixer_obj_stop_voice(size_t n_args, const mp_obj_t *p
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
     mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
 
-    uint8_t v = args[ARG_voice].u_int;
-    if (v > (self->voice_count - 1)) {
-        mp_arg_error_invalid(MP_QSTR_voice);
-    }
+    uint8_t v = mp_arg_validate_int_range(args[ARG_voice].u_int, 0, self->voice_count - 1,
+        MP_QSTR_voice);
     audiomixer_mixervoice_obj_t *voice = MP_OBJ_TO_PTR(self->voice[v]);
     common_hal_audiomixer_mixervoice_stop(voice);
     return mp_const_none;
@@ -226,6 +222,7 @@ MP_DEFINE_CONST_FUN_OBJ_KW(audiomixer_mixer_stop_voice_obj, 1, audiomixer_mixer_
 static const mp_rom_map_elem_t audiomixer_mixer_locals_dict_table[] = {
     // Methods
     { MP_ROM_QSTR(MP_QSTR_deinit), MP_ROM_PTR(&audiomixer_mixer_deinit_obj) },
+    { MP_ROM_QSTR(MP_QSTR___del__), MP_ROM_PTR(&audiomixer_mixer_deinit_obj) },
     { MP_ROM_QSTR(MP_QSTR___enter__), MP_ROM_PTR(&default___enter___obj) },
     { MP_ROM_QSTR(MP_QSTR___exit__), MP_ROM_PTR(&default___exit___obj) },
     { MP_ROM_QSTR(MP_QSTR_play), MP_ROM_PTR(&audiomixer_mixer_play_obj) },

@@ -1,3 +1,6 @@
+# Properties get a dedicated linker section here, so they can drop the unused slots.
+CIRCUITPY_OPTIMIZE_PROPERTY_FLASH_SIZE ?= 1
+
 LD_FILE = $(FLASH).ld $(CHIP_FAMILY).ld imxrt10xx.ld
 
 INTERNAL_LIBM = 1
@@ -30,3 +33,6 @@ CIRCUITPY_USB_MIDI = 1
 LONGINT_IMPL = MPZ
 
 CIRCUITPY_BUILD_EXTENSIONS ?= hex,uf2
+
+# Cleanup is performed by GC finalizers (__del__ -> deinit) instead of a bulk pin reset.
+CIRCUITPY_BULK_RESET = 0

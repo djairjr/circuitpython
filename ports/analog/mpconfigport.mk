@@ -6,6 +6,9 @@
 #
 # SPDX-License-Identifier: MIT
 
+# Properties get a dedicated linker section here, so they can drop the unused slots.
+CIRCUITPY_OPTIMIZE_PROPERTY_FLASH_SIZE ?= 1
+
 CHIP_FAMILY ?= max32
 
 # Necessary to build CircuitPython
@@ -72,3 +75,6 @@ CIRCUITPY_BUSDEVICE = 0
 CIRCUITPY_BUILD_EXTENSIONS ?= elf
 
 CIRCUITPY_PORT_SERIAL = 1
+
+# Cleanup is performed by GC finalizers (__del__ -> deinit) instead of a bulk pin reset.
+CIRCUITPY_BULK_RESET = 0

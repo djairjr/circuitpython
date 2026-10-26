@@ -83,6 +83,18 @@ extensions = [
     "sphinx_search.extension",
     "rstjinja",
     "myst_parser",
+    "llms_txt",
+]
+
+# llms.txt: an index of every page for coding agents (docs/llms_txt.py)
+llms_txt_description = (
+    "Adafruit CircuitPython - Python for microcontrollers. "
+    "Each page is also served as Markdown with the Accept: text/markdown header."
+)
+llms_txt_exclude = [
+    "docs/porting",
+    "docs/pdf",
+    "shared-bindings/support_matrix",
 ]
 
 # Add any paths that contain templates here, relative to this directory.
@@ -197,6 +209,7 @@ exclude_patterns = [
     "docs/README.md",
     "AGENTS.md",
     "**/AGENTS.md",
+    "docs/library/weakref.rst",
 ]
 
 # The reST default role (used for this markup: `text`) to use for all
@@ -330,6 +343,7 @@ latex_elements = {
 \hbadness=99999
 \hfuzz=20pt
 \usepackage{pdflscape}
+\DeclareUnicodeCharacter{FFFD}{?}
 """,
 }
 

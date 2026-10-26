@@ -14,6 +14,10 @@
 #include "nrfx_spim.h"
 #include "nrf_gpio.h"
 
+#if CIRCUITPY_EMMCIO
+#include "common-hal/emmcio/EMMC.h"
+#endif
+
 #ifndef NRFX_SPIM3_ENABLED
 #define NRFX_SPIM3_ENABLED (0)
 #endif
@@ -63,17 +67,6 @@ static const spim_peripheral_t spim_peripherals[] = {
 // https://infocenter.nordicsemi.com/index.jsp?topic=%2Ferrata_nRF52840_Rev2%2FERR%2FnRF52840%2FRev2%2Flatest%2Fanomaly_840_198.html
 static uint8_t *spim3_transmit_buffer = (uint8_t *)SPIM3_BUFFER_RAM_START_ADDR;
 
-void common_hal_busio_spi_never_reset(busio_spi_obj_t *self) {
-    for (size_t i = 0; i < MP_ARRAY_SIZE(spim_peripherals); i++) {
-        if (self->spim_peripheral == &spim_peripherals[i]) {
-            never_reset_pin_number(self->clock_pin_number);
-            never_reset_pin_number(self->MOSI_pin_number);
-            never_reset_pin_number(self->MISO_pin_number);
-            break;
-        }
-    }
-}
-
 // Convert frequency to clock-speed-dependent value. Choose the next lower baudrate if in between
 // available baudrates.
 static nrf_spim_frequency_t baudrate_to_spim_frequency(const uint32_t baudrate) {
@@ -122,6 +115,11 @@ void common_hal_busio_spi_construct(busio_spi_obj_t *self, const mcu_pin_obj_t *
     // Find a free instance, with most desirable (highest freq and not shared) allocated first.
     self->spim_peripheral = NULL;
     for (size_t i = 0; i < MP_ARRAY_SIZE(spim_peripherals); i++) {
+        #if CIRCUITPY_EMMCIO
+        if (spim_peripherals[i].spim.p_reg == NRF_SPIM3 && emmcio_spim3_in_use()) {
+            continue;
+        }
+        #endif
         if ((spim_peripherals[i].spim.p_reg->ENABLE & SPIM_ENABLE_ENABLE_Msk) == 0) {
             self->spim_peripheral = &spim_peripherals[i];
             break;

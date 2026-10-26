@@ -21,24 +21,18 @@ runs:
     - name: Get arm toolchain
       if: >-
         inputs.port != 'none' &&
-        inputs.port != 'litex' &&
         inputs.port != 'espressif' &&
         inputs.port != 'zephyr-cp'
       uses: carlosperate/arm-none-eabi-gcc-action@v1
       with:
-        release: '15.2.Rel1'
+        release: '15.3.Rel1'
 
     # espressif
-    - name: Get espressif toolchain
-      if: inputs.port == 'espressif'
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y ninja-build
-      shell: bash
     - name: Install IDF tools
       if: inputs.port == 'espressif'
       run: |
         $IDF_PATH/install.sh
+        $IDF_PATH/tools/idf_tools.py install ninja
         rm -rf $IDF_TOOLS_PATH/dist
       shell: bash
     - name: Set environment
@@ -46,6 +40,7 @@ runs:
       run: |
         source $IDF_PATH/export.sh
         echo >> $GITHUB_ENV "IDF_PYTHON_ENV_PATH=$IDF_PYTHON_ENV_PATH"
+        echo >> $GITHUB_ENV "ESP_IDF_VERSION=$ESP_IDF_VERSION"
         echo >> $GITHUB_PATH "$PATH"
       shell: bash
 

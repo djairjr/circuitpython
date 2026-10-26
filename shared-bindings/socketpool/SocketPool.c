@@ -17,28 +17,28 @@
 #include "shared-bindings/socketpool/SocketPool.h"
 
 //| class SocketPool:
-//|     """A pool of socket resources available for the given radio. Only one
-//|     SocketPool can be created for each radio.
+//|     """A pool of socket resources available for the given network interface. Only one
+//|     SocketPool can be created for each network interface.
 //|
 //|     SocketPool should be used in place of CPython's socket which provides
 //|     a pool of sockets provided by the underlying OS.
 //|     """
 //|
-//|     def __init__(self, radio: Union[wifi.Radio, hostnetwork.HostNetwork]) -> None:
-//|         """Create a new SocketPool object for the provided radio
+//|     def __init__(self, network_interface: Union[wifi.Radio, mii.Ethernet, hostnetwork.HostNetwork]) -> None:
+//|         """Create a new SocketPool object for the provided network interface
 //|
-//|         :param radio: The (connected) network interface to associate with this
-//|             SocketPool, such as :py:attr:`wifi.radio` or :py:attr:`board.NETWORK`.
+//|         :param network_interface: The (connected) network interface to associate with this
+//|             SocketPool, such as :py:attr:`wifi.radio`, an `mii.Ethernet`, or :py:attr:`board.NETWORK`.
 //|         """
 //|         ...
 //|
 static mp_obj_t socketpool_socketpool_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *args) {
     mp_arg_check_num(n_args, n_kw, 1, 1, false);
 
-    mp_obj_t radio = args[0];
+    mp_obj_t network_interface = args[0];
 
     socketpool_socketpool_obj_t *s = mp_obj_malloc_with_finaliser(socketpool_socketpool_obj_t, &socketpool_socketpool_type);
-    common_hal_socketpool_socketpool_construct(s, radio);
+    common_hal_socketpool_socketpool_construct(s, network_interface);
 
     return MP_OBJ_FROM_PTR(s);
 }
@@ -190,15 +190,27 @@ MP_DEFINE_CONST_OBJ_TYPE(
     );
 
 MP_WEAK MP_NORETURN
-void common_hal_socketpool_socketpool_raise_gaierror_noname(void) {
+void common_hal_socketpool_socketpool_raise_gaierror(int err) {
     vstr_t vstr;
     mp_print_t print;
     vstr_init_print(&vstr, 64, &print);
-    mp_printf(&print, "%S", MP_ERROR_TEXT("Name or service not known"));
+    // Only EAI_NONAME means the name was not found. Other codes cover
+    // unrelated failures, such as an unsupported family, so use the generic
+    // message for those rather than one that would be misleading.
+    if (err == SOCKETPOOL_EAI_NONAME) {
+        mp_printf(&print, "%S", MP_ERROR_TEXT("Name or service not known"));
+    } else {
+        mp_cprintf(&print, MP_ERROR_TEXT("%q failure: %d"), MP_QSTR_getaddrinfo, err);
+    }
 
     mp_obj_t exc_args[] = {
-        MP_OBJ_NEW_SMALL_INT(SOCKETPOOL_EAI_NONAME),
+        MP_OBJ_NEW_SMALL_INT(err),
         mp_obj_new_str_from_vstr(&vstr),
     };
     nlr_raise(mp_obj_new_exception_args(&mp_type_gaierror, MP_ARRAY_SIZE(exc_args), exc_args));
+}
+
+MP_WEAK MP_NORETURN
+void common_hal_socketpool_socketpool_raise_gaierror_noname(void) {
+    common_hal_socketpool_socketpool_raise_gaierror(SOCKETPOOL_EAI_NONAME);
 }

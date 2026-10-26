@@ -48,8 +48,20 @@ extern void common_hal_mcu_enable_interrupts(void);
 #define MICROPY_PY_OS_DUPTERM            (0)
 #define MICROPY_PYEXEC_COMPILE_ONLY      (0)
 #define MICROPY_ROM_TEXT_COMPRESSION     (0)
+#ifndef MICROPY_VFS_LFS1
 #define MICROPY_VFS_LFS1                 (0)
+#endif
+#ifndef MICROPY_VFS_LFS2
 #define MICROPY_VFS_LFS2                 (0)
+#endif
+
+// CIRCUITPY-CHANGE: Compile-time choice of the CIRCUITPY filesystem. When 1,
+// the supervisor mounts littlefs instead of FAT on the block device returned
+// by supervisor_flash_*. Ports set this (and MICROPY_VFS_LFS2) from their
+// board configuration; the default remains FAT.
+#ifndef CIRCUITPY_FILESYSTEM_LITTLEFS
+#define CIRCUITPY_FILESYSTEM_LITTLEFS    (0)
+#endif
 
 // Always turn on exit code handling
 #define MICROPY_PYEXEC_ENABLE_EXIT_CODE_HANDLING (1)
@@ -105,6 +117,7 @@ extern void common_hal_mcu_enable_interrupts(void);
 #define MICROPY_OPT_MPZ_BITWISE          (0)
 #define MICROPY_OPT_CACHE_MAP_LOOKUP_IN_BYTECODE (CIRCUITPY_OPT_CACHE_MAP_LOOKUP_IN_BYTECODE)
 #define MICROPY_PERSISTENT_CODE_LOAD     (1)
+#define MICROPY_PERSISTENT_CODE_LOAD_NATIVE (CIRCUITPY_LOAD_NATIVE || CIRCUITPY_ENABLE_MPY_NATIVE)
 
 #define MICROPY_PY_ARRAY                 (CIRCUITPY_ARRAY)
 #define MICROPY_PY_ARRAY_SLICE_ASSIGN    (1)
@@ -191,6 +204,9 @@ extern void common_hal_mcu_enable_interrupts(void);
 #define FILESYSTEM_BLOCK_SIZE       (512)
 
 #define MICROPY_VFS                 (1)
+// CIRCUITPY-CHANGE: CircuitPython's flash/SD block devices are native
+// (supervisor/shared/flash.c sets MP_BLOCKDEV_FLAG_NATIVE).
+#define MICROPY_VFS_BLOCKDEV_NATIVE (1)
 #define MICROPY_VFS_FAT             (MICROPY_VFS)
 #define MICROPY_READER_VFS          (MICROPY_VFS)
 
@@ -198,7 +214,12 @@ extern void common_hal_mcu_enable_interrupts(void);
 
 #define BYTES_PER_WORD (4)
 
+// Bit 0 of a code pointer selects the Thumb instruction set.
+#if defined(__thumb__)
 #define MICROPY_MAKE_POINTER_CALLABLE(p) ((void *)((mp_uint_t)(p) | 1))
+#else
+#define MICROPY_MAKE_POINTER_CALLABLE(p) ((void *)(p))
+#endif
 
 // Track stack usage. Expose results via ustack module.
 #define MICROPY_MAX_STACK_USAGE       (0)
@@ -233,6 +254,11 @@ typedef long mp_off_t;
 
 #ifndef MICROPY_CPYTHON_EXCEPTION_CHAIN
 #define MICROPY_CPYTHON_EXCEPTION_CHAIN       (CIRCUITPY_FULL_BUILD)
+#endif
+
+// Allow %e/%f/%g in mp_printf().
+#ifndef MICROPY_PRINTF_FLOAT
+#define MICROPY_PRINTF_FLOAT                  (CIRCUITPY_FULL_BUILD && MICROPY_PY_BUILTINS_FLOAT)
 #endif
 
 #define MICROPY_PY_BUILTINS_POW3              (CIRCUITPY_BUILTINS_POW3)
@@ -383,6 +409,11 @@ typedef long mp_off_t;
 #define CIRCUITPY_CONSOLE_UART_HEXDUMP(...) (void)0
 #endif
 
+// Normally set from CIRCUITPY_BUSIO_SPI_ASYNC in the .mk files.
+#ifndef CIRCUITPY_BUSIO_SPI_ASYNC
+#define CIRCUITPY_BUSIO_SPI_ASYNC (0)
+#endif
+
 // These CIRCUITPY_xxx values should all be defined in the *.mk files as being on or off.
 // So if any are not defined in *.mk, they'll throw an error here.
 
@@ -391,16 +422,13 @@ typedef long mp_off_t;
 #define CIRCUITPY_DISPLAY_LIMIT (1)
 #endif
 
-// Display area buffer size in bytes for _refresh_area() VLA.
-// Allocated on stack; boards with larger displays can override per-board.
-// Default 512 bytes = 128 uint32_t words.
+// Normally set from CIRCUITPY_DISPLAY_AREA_BUFFER_SIZE in the .mk files.
 #ifndef CIRCUITPY_DISPLAY_AREA_BUFFER_SIZE
 #define CIRCUITPY_DISPLAY_AREA_BUFFER_SIZE (512)
 #endif
 
 #else
 #define CIRCUITPY_DISPLAY_LIMIT (0)
-#define CIRCUITPY_DISPLAY_AREA_BUFFER_SIZE (0)
 #endif
 
 // This is not a top-level module; it's microcontroller.nvm.
@@ -415,6 +443,19 @@ extern const struct _mp_obj_module_t nvm_module;
 // The random module is fairly large.
 #ifndef ULAB_NUMPY_HAS_RANDOM_MODULE
 #define ULAB_NUMPY_HAS_RANDOM_MODULE (0)
+#endif
+
+// The scipy.integrate module is about 6 kB.
+#ifndef ULAB_SCIPY_HAS_INTEGRATE_MODULE
+#define ULAB_SCIPY_HAS_INTEGRATE_MODULE (0)
+#endif
+
+// The ndarray modulo operators are about 4 kB.
+#ifndef NDARRAY_HAS_BINARY_OP_MODULO
+#define NDARRAY_HAS_BINARY_OP_MODULO (0)
+#endif
+#ifndef NDARRAY_HAS_INPLACE_MODULO
+#define NDARRAY_HAS_INPLACE_MODULO (0)
 #endif
 
 #if CIRCUITPY_ULAB
@@ -530,6 +571,11 @@ void background_callback_run_all(void);
 #ifndef CIRCUITPY_SDCARD_USB
 #if CIRCUITPY_USB_DEVICE
 #define CIRCUITPY_SDCARD_USB (CIRCUITPY_SDCARDIO && CIRCUITPY_USB_MSC)
+// Default value of CIRCUITPY_SDCARD_USB in settings.toml.
+#ifndef CIRCUITPY_SDCARD_USB_DEFAULT
+// True for most boards.
+#define CIRCUITPY_SDCARD_USB_DEFAULT (true)
+#endif
 #else
 #define CIRCUITPY_SDCARD_USB (0)
 #endif
@@ -559,6 +605,11 @@ void background_callback_run_all(void);
 
 #ifndef CIRCUITPY_USB_HOST_HIGH_SPEED
 #define CIRCUITPY_USB_HOST_HIGH_SPEED 0
+#endif
+
+// usb_host_bulk takes a usb.core.Device and uses TinyUSB host calls.
+#if CIRCUITPY_USB_HOST_BULK && !(CIRCUITPY_USB_HOST && CIRCUITPY_PYUSB)
+#error CIRCUITPY_USB_HOST_BULK requires CIRCUITPY_USB_HOST and CIRCUITPY_PYUSB
 #endif
 
 // If the port requires certain USB endpoint numbers, define these in mpconfigport.h.
@@ -688,6 +739,13 @@ void background_callback_run_all(void);
 #endif
 #if defined(CIRCUITPY_BOOT_BUTTON) && CIRCUITPY_BOOT_BUTTON_NO_GPIO
 #error "CIRCUITPY_BOOT_BUTTON and CIRCUITPY_BOOT_BUTTON_NO_GPIO are mutually exclusive"
+#endif
+
+// Boards that define CIRCUITPY_BOOT_BUTTON can set
+// CIRCUITPY_BOOT_BUTTON_ACTIVE_HIGH to 1 when the button pin reads high while
+// pressed. The default is active-low (the pin reads low while pressed).
+#ifndef CIRCUITPY_BOOT_BUTTON_ACTIVE_HIGH
+#define CIRCUITPY_BOOT_BUTTON_ACTIVE_HIGH (0)
 #endif
 
 #if defined(__GNUC__) && !defined(__ZEPHYR__)

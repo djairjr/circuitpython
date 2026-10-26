@@ -52,14 +52,33 @@ void check_gatt_status(uint16_t gatt_status) {
         return;
     }
     switch (gatt_status) {
+        case BLE_GATT_STATUS_ATTERR_READ_NOT_PERMITTED:
+            mp_raise_bleio_BluetoothError(MP_ERROR_TEXT("%q not permitted"), MP_QSTR_read);
+            return;
+        case BLE_GATT_STATUS_ATTERR_WRITE_NOT_PERMITTED:
+            mp_raise_bleio_BluetoothError(MP_ERROR_TEXT("%q not permitted"), MP_QSTR_write);
+            return;
         case BLE_GATT_STATUS_ATTERR_INSUF_AUTHENTICATION:
             mp_raise_bleio_SecurityError(MP_ERROR_TEXT("Insufficient authentication"));
             return;
+        case BLE_GATT_STATUS_ATTERR_INSUF_AUTHORIZATION:
+            mp_raise_bleio_SecurityError(MP_ERROR_TEXT("Insufficient authorization"));
+            return;
         case BLE_GATT_STATUS_ATTERR_INSUF_ENCRYPTION:
+        case BLE_GATT_STATUS_ATTERR_INSUF_ENC_KEY_SIZE:
             mp_raise_bleio_SecurityError(MP_ERROR_TEXT("Insufficient encryption"));
             return;
+        case BLE_GATT_STATUS_ATTERR_INVALID_ATT_VAL_LENGTH:
+            mp_arg_error_invalid(MP_QSTR_length);
+            return;
         default:
-            mp_raise_bleio_BluetoothError(MP_ERROR_TEXT("Unknown gatt error: 0x%04x"), gatt_status);
+            if (gatt_status > BLE_GATT_STATUS_ATTERR_INVALID &&
+                gatt_status <= BLE_GATT_STATUS_ATTERR_CPS_OUT_OF_RANGE) {
+                // Some other ATT error from the peer.
+                mp_raise_bleio_BluetoothError(MP_ERROR_TEXT("Unknown gatt error: 0x%04x"), gatt_status);
+            }
+            // Not an ATT error, e.g. BLE_GATT_STATUS_UNKNOWN.
+            mp_raise_bleio_BluetoothError(MP_ERROR_TEXT("Unknown BLE error: 0x%04x"), gatt_status);
     }
 }
 
@@ -70,12 +89,15 @@ void check_sec_status(uint8_t sec_status) {
 
     switch (sec_status) {
         case BLE_GAP_SEC_STATUS_UNSPECIFIED:
-            mp_raise_bleio_SecurityError(MP_ERROR_TEXT("Unspecified issue. Can be that the pairing prompt on the other device was declined or ignored."));
+            mp_raise_bleio_SecurityError(MP_ERROR_TEXT("Unspecified issue. The pairing request on the other device may have been declined or ignored."));
             return;
         default:
             mp_raise_bleio_SecurityError(MP_ERROR_TEXT("Unknown security error: 0x%04x"), sec_status);
     }
 }
+
+uint16_t bleio_gatts_min_handle = 0xFFFF;
+uint16_t bleio_gatts_max_handle;
 
 void common_hal_bleio_init(void) {
 }
@@ -85,6 +107,30 @@ void bleio_user_reset(void) {
         // Stop any user scanning or advertising.
         common_hal_bleio_adapter_stop_scan(&common_hal_bleio_adapter_obj);
         common_hal_bleio_adapter_stop_advertising(&common_hal_bleio_adapter_obj);
+
+        // Disconnect the connections that user code initiated or accepted with its
+        // own advertising. The BLE workflow connection is not user-owned and stays up.
+        //
+        // Clear each connection's pointers into the VM heap first: the heap is about
+        // to go away, and a disconnect completes asynchronously, possibly after it
+        // has. The disconnect event handler dereferences connection_obj unless it is
+        // mp_const_none.
+        for (size_t i = 0; i < BLEIO_TOTAL_CONNECTION_COUNT; i++) {
+            bleio_connection_internal_t *connection = &bleio_connections[i];
+            connection->connection_obj = mp_const_none;
+            connection->remote_service_list = NULL;
+            if (connection->conn_handle != BLE_CONN_HANDLE_INVALID && connection->user_owned) {
+                common_hal_bleio_connection_disconnect(connection);
+            }
+        }
+
+        // Clear the adapter's remaining pointers into the VM heap. The full stack
+        // reset in bleio_reset() used to do this implicitly, but it no longer always
+        // runs. The adapter struct is a GC root, so a pointer left over from this
+        // heap would be scanned as a live object in the next VM's heap.
+        common_hal_bleio_adapter_obj.connection_objs = NULL;
+        common_hal_bleio_adapter_obj.advertising_data = NULL;
+        common_hal_bleio_adapter_obj.scan_response_data = NULL;
     }
 
     ble_drv_remove_heap_handlers();
@@ -100,6 +146,16 @@ void bleio_reset(void) {
     if (!common_hal_bleio_adapter_get_enabled(&common_hal_bleio_adapter_obj)) {
         return;
     }
+
+    // The SoftDevice cannot remove individual services from its GATT table: the
+    // disable/enable cycle below is the only way to clear them, and it drops every
+    // connection, the BLE workflow's included. So run it only when user code created
+    // services. All other user BLE state has already been torn down individually by
+    // bleio_user_reset().
+    if (!bleio_get_user_services_created()) {
+        return;
+    }
+    bleio_clear_user_services_created();
 
     supervisor_stop_bluetooth();
     bleio_adapter_reset(&common_hal_bleio_adapter_obj);
@@ -212,12 +268,49 @@ size_t bleio_gattc_read(uint16_t handle, uint16_t conn_handle, uint8_t *buf, siz
     while (!read_info.done) {
         RUN_BACKGROUND_TASKS;
     }
+    // Remove the handler before anything can raise: it points at read_info on this stack frame.
+    ble_drv_remove_event_handler(_on_gattc_read_rsp_evt, &read_info);
+
     // Test if we were disconnected while reading
     bleio_check_connected(read_info.conn_handle);
-
-    ble_drv_remove_event_handler(_on_gattc_read_rsp_evt, &read_info);
     check_gatt_status(read_info.status);
     return read_info.final_len;
+}
+
+typedef struct {
+    uint16_t handle;
+    uint16_t conn_handle;
+    volatile uint16_t status;
+    volatile bool done;
+} write_info_t;
+
+static bool _on_gattc_write_rsp_evt(ble_evt_t *ble_evt, void *param) {
+    write_info_t *write = param;
+    switch (ble_evt->header.evt_id) {
+        case BLE_GATTC_EVT_WRITE_RSP: {
+            ble_gattc_evt_t *evt = &ble_evt->evt.gattc_evt;
+            // Another write request (e.g. a CCCD write) may still have been in progress
+            // when this one started, so match the handle as well as the connection.
+            uint16_t rsp_handle = evt->gatt_status == BLE_GATT_STATUS_SUCCESS
+                ? evt->params.write_rsp.handle
+                : evt->error_handle;
+            if (evt->conn_handle != write->conn_handle || rsp_handle != write->handle) {
+                return false;
+            }
+            write->status = evt->gatt_status;
+            write->done = true;
+            break;
+        }
+        case BLE_GAP_EVT_DISCONNECTED:
+            if (ble_evt->evt.gap_evt.conn_handle == write->conn_handle) {
+                write->conn_handle = BLE_CONN_HANDLE_INVALID;
+                write->done = true;
+            }
+            return false;
+        default:
+            return false;
+    }
+    return true;
 }
 
 void bleio_gattc_write(uint16_t handle, uint16_t conn_handle, mp_buffer_info_t *bufinfo, bool write_no_response) {
@@ -230,24 +323,47 @@ void bleio_gattc_write(uint16_t handle, uint16_t conn_handle, mp_buffer_info_t *
         .len = bufinfo->len,
     };
 
+    // A write with response waits for the response, so that errors from the peer are reported.
+    write_info_t write_info = {
+        .handle = handle,
+        .conn_handle = conn_handle,
+        .status = BLE_GATT_STATUS_SUCCESS,
+        .done = false,
+    };
+    if (!write_no_response) {
+        ble_drv_add_event_handler(_on_gattc_write_rsp_evt, &write_info);
+    }
+
     while (1) {
         uint32_t err_code = sd_ble_gattc_write(conn_handle, &write_params);
         if (err_code == NRF_SUCCESS) {
             break;
         }
 
-        // Write with response will return NRF_ERROR_BUSY if the response has not been received.
+        // Write with response will return NRF_ERROR_BUSY if another write request is in progress.
         // Write without response will return NRF_ERROR_RESOURCES if too many writes are pending.
         if (err_code == NRF_ERROR_BUSY || err_code == NRF_ERROR_RESOURCES) {
-            // We could wait for an event indicating the write is complete, but just retrying is easier.
             MICROPY_VM_HOOK_LOOP;
             continue;
         }
 
         // Some real error occurred.
+        ble_drv_remove_event_handler(_on_gattc_write_rsp_evt, &write_info);
         check_nrf_error(err_code);
     }
 
+    if (write_no_response) {
+        return;
+    }
+
+    while (!write_info.done) {
+        RUN_BACKGROUND_TASKS;
+    }
+    ble_drv_remove_event_handler(_on_gattc_write_rsp_evt, &write_info);
+
+    // Test if we were disconnected while writing.
+    bleio_check_connected(write_info.conn_handle);
+    check_gatt_status(write_info.status);
 }
 
 void bleio_background(void) {

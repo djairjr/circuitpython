@@ -28,6 +28,14 @@ class StdSerial:
             self.stdin.close()
         self.stdout.close()
 
+    def read_some(self, limit=65536):
+        # read1() hands back whatever is already buffered and does at most one
+        # read on the pipe, so it blocks only when nothing has arrived yet.
+        data = self.stdout.read1(limit)
+        if data == b"":
+            raise EOFError("stdout closed")
+        return data
+
     @property
     def in_waiting(self):
         if self.stdout is None:
@@ -47,13 +55,22 @@ class SerialSaver:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._cv = threading.Condition(self._lock)
+        self._read_some = getattr(serial_obj, "read_some", None)
         self._reader = threading.Thread(target=self._reader_loop, daemon=True)
         self._reader.start()
 
     def _reader_loop(self):
         while not self._stop.is_set():
             try:
-                read = self.serial.read(1)
+                if self._read_some is not None:
+                    read = self._read_some()
+                else:
+                    read = self.serial.read(1)
+                    # in_waiting is a non-blocking check on a real serial port,
+                    # so draining it here is free.
+                    waiting = self.serial.in_waiting
+                    if waiting:
+                        read += self.serial.read(waiting)
             except Exception:
                 # Serial port closed or device disconnected.
                 break
@@ -131,6 +148,12 @@ class NativeSimProcess:
         if "connected to pseudotty:" not in uart_pty_line:
             raise RuntimeError("Failed to connect to UART")
         pty_path = uart_pty_line.strip().rsplit(":", maxsplit=1)[1].strip()
+        # The console UART's device name ("uart"). Other PTY UARTs announce
+        # their pseudotty in the same way, so reconnect_serial() looks for this
+        # name's line only.
+        self._console_pty_marker = (
+            uart_pty_line.split("connected to pseudotty:")[0].strip() + " connected to pseudotty:"
+        )
         self.serial = SerialSaver(
             serial.Serial(pty_path, baudrate=115200, timeout=0.05, write_timeout=0),
             name="uart0",
@@ -138,6 +161,47 @@ class NativeSimProcess:
         self.debug_serial = SerialSaver(
             StdSerial(self._proc.stdin, self._proc.stdout), name="debug"
         )
+        # Offset into debug_serial output for finding the next UART PTY path.
+        self._pty_search_offset = 0
+
+    def reconnect_serial(self, timeout=30.0):
+        """Wait for the simulator to reboot (execv) and reopen the UART.
+
+        native_sim/bsim reboot by re-executing the process; the UART PTY master
+        fd is O_CLOEXEC so it closes on execv and a new PTY is opened. The new
+        "connected to pseudotty: <path>" line is printed to the process stdout
+        (which survives execv), so it shows up in debug_serial. This method waits
+        for that line and reopens ``self.serial`` on the new PTY.
+        """
+        import time
+
+        marker = self._console_pty_marker
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._proc.poll() is not None:
+                return False
+            out = self.debug_serial.all_output
+            # Only a line that starts with the console's name: the marker must
+            # not match the end of another UART's line.
+            idx = out.find(marker, self._pty_search_offset)
+            while idx > 0 and out[idx - 1] not in "\r\n":
+                idx = out.find(marker, idx + 1)
+            newline = out.find("\n", idx) if idx >= 0 else -1
+            if idx >= 0 and newline >= 0:
+                line = out[idx:newline]
+                pty_path = line.strip().rsplit(":", maxsplit=1)[1].strip()
+                self._pty_search_offset = newline + 1
+                try:
+                    self.serial.close()
+                except Exception:
+                    pass
+                self.serial = SerialSaver(
+                    serial.Serial(pty_path, baudrate=115200, timeout=0.05, write_timeout=0),
+                    name="uart0",
+                )
+                return True
+            time.sleep(0.05)
+        return False
 
     def shutdown(self):
         if self._proc.poll() is None:

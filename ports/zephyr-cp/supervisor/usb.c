@@ -3,6 +3,10 @@
 #include "shared-bindings/usb_cdc/__init__.h"
 #include "shared-bindings/usb_cdc/Serial.h"
 
+#if CIRCUITPY_USB_HID
+#include "common-hal/usb_hid/__init__.h"
+#endif
+
 #include "supervisor/zephyr-cp.h"
 
 #include "extmod/vfs.h"
@@ -13,18 +17,32 @@
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/disk.h>
 #include <zephyr/drivers/pinctrl.h>
+#include <zephyr/drivers/uart.h>
 #include <zephyr/kernel.h>
 #include <zephyr/usb/usbd.h>
 #include <zephyr/usb/class/usbd_msc.h>
+#if DT_HAS_COMPAT_STATUS_OKAY(nordic_nrf_usbd)
+#include <nrfx_power.h>
+#endif
 
 #include "shared-module/storage/__init__.h"
 #include "supervisor/filesystem.h"
+#include "supervisor/port.h"
 #include "supervisor/shared/reload.h"
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(cpusb, CONFIG_LOG_DEFAULT_LEVEL);
 
 #define USB_DEVICE DT_NODELABEL(zephyr_udc0)
+
+// usbd_register_class() below names the CDC ACM classes "cdc_acm_<n>", where
+// n is the devicetree instance number. A board or bootloader overlay that
+// adds its own cdc-acm-uart node renumbers them, so check that instance 0 is
+// the console and instance 1 the data port.
+BUILD_ASSERT(DT_SAME_NODE(DT_INST(0, zephyr_cdc_acm_uart), DT_NODELABEL(cdc_acm_console)),
+    "CDC ACM instance 0 must be cdc_acm_console");
+BUILD_ASSERT(DT_SAME_NODE(DT_INST(1, zephyr_cdc_acm_uart), DT_NODELABEL(cdc_acm_data)),
+    "CDC ACM instance 1 must be cdc_acm_data");
 
 USBD_DEVICE_DEFINE(main_usbd,
     DEVICE_DT_GET(DT_NODELABEL(zephyr_udc0)),
@@ -33,6 +51,10 @@ USBD_DEVICE_DEFINE(main_usbd,
 USBD_DESC_LANG_DEFINE(main_lang);
 USBD_DESC_MANUFACTURER_DEFINE(main_mfr, USB_MANUFACTURER);
 USBD_DESC_PRODUCT_DEFINE(main_product, USB_PRODUCT);
+// The stack fills this from hwinfo and fails the request without a driver.
+#if defined(CONFIG_HWINFO_HAS_DRIVER)
+USBD_DESC_SERIAL_NUMBER_DEFINE(main_sn);
+#endif
 
 USBD_DESC_CONFIG_DEFINE(fs_cfg_desc, "FS Configuration");
 USBD_DESC_CONFIG_DEFINE(hs_cfg_desc, "HS Configuration");
@@ -95,8 +117,11 @@ int _zephyr_disk_init(struct disk_info *disk) {
     return 0;
 }
 
+// We don't check whether the filesystem is littlefs below because we know these
+// are APIs used by USB MSC and we enforce it to be FAT at build time.
 int _zephyr_disk_status(struct disk_info *disk) {
-    fs_user_mount_t *root = filesystem_circuitpy();
+    supervisor_vfs_t *root_vfs = filesystem_circuitpy();
+    fs_user_mount_t *root = root_vfs == NULL ? NULL : &root_vfs->fat;
     int lun = 0;
     if (root == NULL) {
         printk("Status: No media\n");
@@ -107,7 +132,7 @@ int _zephyr_disk_status(struct disk_info *disk) {
         return DISK_STATUS_WR_PROTECT;
     }
     // Lock the blockdev once we say we're writable.
-    if (!locked[lun] && !blockdev_lock(root)) {
+    if (!locked[lun] && !blockdev_lock((supervisor_vfs_t *)root)) {
         printk("Status: Locked\n");
         return DISK_STATUS_WR_PROTECT;
     }
@@ -116,7 +141,8 @@ int _zephyr_disk_status(struct disk_info *disk) {
 }
 
 int _zephyr_disk_read(struct disk_info *disk, uint8_t *data_buf, uint32_t start_sector, uint32_t num_sector) {
-    fs_user_mount_t *root = filesystem_circuitpy();
+    supervisor_vfs_t *root_vfs = filesystem_circuitpy();
+    fs_user_mount_t *root = root_vfs == NULL ? NULL : &root_vfs->fat;
 
     uint32_t disk_block_count;
     disk_ioctl(root, GET_SECTOR_COUNT, &disk_block_count);
@@ -129,7 +155,8 @@ int _zephyr_disk_read(struct disk_info *disk, uint8_t *data_buf, uint32_t start_
 }
 
 int _zephyr_disk_write(struct disk_info *disk, const uint8_t *data_buf, uint32_t start_sector, uint32_t num_sector) {
-    fs_user_mount_t *root = filesystem_circuitpy();
+    supervisor_vfs_t *root_vfs = filesystem_circuitpy();
+    fs_user_mount_t *root = root_vfs == NULL ? NULL : &root_vfs->fat;
     int lun = 0;
     autoreload_suspend(AUTORELOAD_SUSPEND_USB);
     disk_write(root, data_buf, start_sector, num_sector);
@@ -162,7 +189,8 @@ int _zephyr_disk_write(struct disk_info *disk, const uint8_t *data_buf, uint32_t
 
 int _zephyr_disk_ioctl(struct disk_info *disk, uint8_t cmd, void *buff) {
 
-    fs_user_mount_t *root = filesystem_circuitpy();
+    supervisor_vfs_t *root_vfs = filesystem_circuitpy();
+    fs_user_mount_t *root = root_vfs == NULL ? NULL : &root_vfs->fat;
     int lun = 0;
     switch (cmd) {
         case DISK_IOCTL_GET_SECTOR_COUNT:
@@ -172,7 +200,8 @@ int _zephyr_disk_ioctl(struct disk_info *disk, uint8_t cmd, void *buff) {
             disk_ioctl(root, GET_SECTOR_SIZE, buff);
             return 0;
         case DISK_IOCTL_CTRL_SYNC:
-            disk_ioctl(root, CTRL_SYNC, buff);
+            // Zephyr's MSC class sends this after every WRITE10. Don't flush
+            // here; the background flush writes the cached page.
             autoreload_resume(AUTORELOAD_SUSPEND_USB);
 
             // This write is complete; initiate an autoreload if this was a file data or metadata write,
@@ -189,21 +218,88 @@ int _zephyr_disk_ioctl(struct disk_info *disk, uint8_t cmd, void *buff) {
     return 0;
 }
 
+// Tracks whether the USB host has selected a configuration, i.e. the device has
+// enumerated. Written from the USBD message callback (USBD thread or system
+// workqueue context) and read from the CircuitPython VM thread, so keep it
+// volatile to avoid the compiler caching stale values.
+static volatile bool usb_configured = false;
+
+static const struct device *const console_dev = DEVICE_DT_GET(DT_NODELABEL(cdc_acm_console));
+static bool console_dtr = false;
+static bool usb_suspended = false;
+
+// With flow control on, the CDC ACM driver's poll_out waits for room in its
+// TX buffer instead of dropping output. Use it for the console only while
+// the host is connected, awake and holds DTR, as TinyUSB does.
+static void update_console_flow_control(void) {
+    bool on = usb_configured && !usb_suspended && console_dtr;
+    struct uart_config config = {
+        .flow_ctrl = on ? UART_CFG_FLOW_CTRL_RTS_CTS : UART_CFG_FLOW_CTRL_NONE,
+    };
+    uart_configure(console_dev, &config);
+}
+
+// First enabled CDC, as on TinyUSB ports.
+static const struct device *touch_cdc;
+
+static bool touch_requested(void) {
+    uint32_t baudrate = 0;
+    uint32_t dtr = 1;
+    if (uart_line_ctrl_get(touch_cdc, UART_LINE_CTRL_BAUD_RATE, &baudrate) != 0 ||
+        uart_line_ctrl_get(touch_cdc, UART_LINE_CTRL_DTR, &dtr) != 0) {
+        return false;
+    }
+    return baudrate == 1200 && dtr == 0;
+}
+
 static void _msg_cb(struct usbd_context *const ctx, const struct usbd_msg *msg) {
     LOG_INF("USBD message: %s", usbd_msg_type_string(msg->type));
 
     if (usbd_can_detect_vbus(ctx)) {
         if (msg->type == USBD_MSG_VBUS_READY) {
+            usb_configured = false;
             if (usbd_enable(ctx)) {
                 LOG_ERR("Failed to enable device support");
             }
         }
 
         if (msg->type == USBD_MSG_VBUS_REMOVED) {
+            usb_configured = false;
             if (usbd_disable(ctx)) {
                 LOG_ERR("Failed to disable device support");
             }
         }
+    }
+
+    // A non-zero configuration value means the host has enumerated us.
+    // A value of zero (or a bus reset / VBUS removal) unconfigures us.
+    if (msg->type == USBD_MSG_CONFIGURATION) {
+        usb_configured = (msg->status != 0);
+    } else if (msg->type == USBD_MSG_RESET) {
+        usb_configured = false;
+    }
+
+    if (msg->type == USBD_MSG_SUSPEND) {
+        usb_suspended = true;
+    } else if (msg->type == USBD_MSG_RESUME || msg->type == USBD_MSG_RESET) {
+        usb_suspended = false;
+    }
+    if (msg->type == USBD_MSG_RESET) {
+        console_dtr = false;
+    } else if (msg->type == USBD_MSG_CDC_ACM_CONTROL_LINE_STATE && msg->dev == console_dev) {
+        uint32_t dtr = 0;
+        uart_line_ctrl_get(console_dev, UART_LINE_CTRL_DTR, &dtr);
+        console_dtr = dtr != 0;
+    }
+    update_console_flow_control();
+
+    // 1200 baud + DTR low, in either order.
+    if ((msg->type == USBD_MSG_CDC_ACM_LINE_CODING ||
+         msg->type == USBD_MSG_CDC_ACM_CONTROL_LINE_STATE) &&
+        msg->dev == touch_cdc && touch_requested()) {
+        // Detach so the host sees a disconnect.
+        usbd_disable(&main_usbd);
+        reset_to_bootloader();
     }
 }
 
@@ -230,11 +326,19 @@ void usb_init(void) {
         return;
     }
 
+    #if defined(CONFIG_HWINFO_HAS_DRIVER)
+    err = usbd_add_descriptor(&main_usbd, &main_sn);
+    if (err) {
+        LOG_ERR("Failed to initialize serial number descriptor (%d)", err);
+        return;
+    }
+    #endif
+
     bool console = usb_cdc_console_enabled();
     if (console) {
-        uint8_t *receiver_buffer = port_malloc(128, true);
+        uint8_t *receiver_buffer = port_malloc(1024, true);
         if (receiver_buffer != NULL) {
-            common_hal_usb_cdc_serial_construct_from_device(&usb_cdc_console_obj, DEVICE_DT_GET(DT_NODELABEL(cdc_acm_console)), 128, receiver_buffer);
+            common_hal_usb_cdc_serial_construct_from_device(&usb_cdc_console_obj, DEVICE_DT_GET(DT_NODELABEL(cdc_acm_console)), 1024, receiver_buffer, true);
         } else {
             console = false;
         }
@@ -243,9 +347,9 @@ void usb_init(void) {
 
     bool data = usb_cdc_data_enabled();
     if (data) {
-        uint8_t *receiver_buffer = port_malloc(128, true);
+        uint8_t *receiver_buffer = port_malloc(1024, true);
         if (receiver_buffer != NULL) {
-            common_hal_usb_cdc_serial_construct_from_device(&usb_cdc_data_obj, DEVICE_DT_GET(DT_NODELABEL(cdc_acm_data)), 128, receiver_buffer);
+            common_hal_usb_cdc_serial_construct_from_device(&usb_cdc_data_obj, DEVICE_DT_GET(DT_NODELABEL(cdc_acm_data)), 1024, receiver_buffer, false);
         } else {
             data = false;
         }
@@ -293,6 +397,17 @@ void usb_init(void) {
             printk("Registered MSC class for high speed\n");
         }
 
+        #if CIRCUITPY_USB_HID
+        if (usb_hid_enabled()) {
+            printk("Registering High-Speed hid class\n");
+            err = usbd_register_class(&main_usbd, "hid_0", USBD_SPEED_HS, 1);
+            if (err) {
+                printk("Failed to register HID class (HS) %d\n", err);
+                return;
+            }
+        }
+        #endif
+
         usbd_device_set_code_triple(&main_usbd, USBD_SPEED_HS,
             USB_BCC_MISCELLANEOUS, 0x02, 0x01);
     }
@@ -334,10 +449,27 @@ void usb_init(void) {
     }
     /* doc functions register end */
 
+    #if CIRCUITPY_USB_HID
+    if (usb_hid_enabled()) {
+        printk("Registering Full-Speed hid class\n");
+        err = usbd_register_class(&main_usbd, "hid_0", USBD_SPEED_FS, 1);
+        if (err) {
+            printk("Failed to register HID class (FS) %d\n", err);
+            return;
+        }
+    }
+    #endif
+
     usbd_device_set_code_triple(&main_usbd, USBD_SPEED_FS,
         USB_BCC_MISCELLANEOUS, 0x02, 0x01);
     printk("Setting self powered\n");
     usbd_self_powered(&main_usbd, attributes & USB_SCD_SELF_POWERED);
+
+    if (usb_cdc_console_enabled()) {
+        touch_cdc = DEVICE_DT_GET(DT_NODELABEL(cdc_acm_console));
+    } else if (usb_cdc_data_enabled()) {
+        touch_cdc = DEVICE_DT_GET(DT_NODELABEL(cdc_acm_data));
+    }
 
     printk("Registering callback\n");
     err = usbd_msg_register_cb(&main_usbd, _msg_cb);
@@ -346,27 +478,63 @@ void usb_init(void) {
         return;
     }
 
+    #if CIRCUITPY_USB_HID
+    printk("Initializing HID\n");
+    usb_hid_init_devices();
+    #endif
+
     printk("usbd_init\n");
     err = usbd_init(&main_usbd);
     if (err) {
-        LOG_ERR("Failed to initialize device support");
+        LOG_ERR("Failed to initialize device support (%d)", err);
         return;
     }
 
     printk("USB initialized\n");
 
     if (!usbd_can_detect_vbus(&main_usbd)) {
+        /* No VBUS detection — just enable unconditionally. */
         err = usbd_enable(&main_usbd);
         if (err) {
-            LOG_ERR("Failed to enable device support");
+            LOG_ERR("Failed to enable device support (%d)", err);
             return;
         }
-        printk("usbd enabled\n");
+    } else {
+        #if DT_HAS_COMPAT_STATUS_OKAY(nordic_nrf_usbd)
+        /*
+         * On nRF52 USBD, the UDC driver enables VBUS detection interrupts
+         * inside usbd_init(). If USB is already plugged in, the VBUS_READY
+         * event arrives before usbd_init() sets status.initialized = true,
+         * causing a __ASSERT in usbd_thread (with CONFIG_ASSERT=y) that kills
+         * the event-processing thread. Our _msg_cb then never receives
+         * VBUS_READY, and USB never enumerates.
+         *
+         * Work around the race by checking the current VBUS state directly.
+         * udc_nrf_enable() does not require VBUS to be present, so it's safe
+         * to call usbd_enable() if VBUS is already up.
+         */
+        nrfx_power_usb_state_t vbus = nrfx_power_usbstatus_get();
+        if (vbus != NRFX_POWER_USB_STATE_DISCONNECTED) {
+            err = usbd_enable(&main_usbd);
+            if (err) {
+                LOG_ERR("Failed to enable device support (%d)", err);
+                return;
+            }
+        }
+        #else
+        /*
+         * On nRF54 USBHS, VBUS events arrive via NRFS IPC which has a natural
+         * startup delay, so the assert race doesn't occur. Additionally,
+         * udc_enable() blocks until VBUS is ready, so we must NOT call
+         * usbd_enable() here — let _msg_cb handle it on VBUS_READY.
+         */
+        #endif
     }
 }
 
 bool usb_connected(void) {
-    return false;
+    // Mirrors TinyUSB's tud_ready(): configured (mounted) and not suspended.
+    return usb_configured && !usbd_is_suspended(&main_usbd);
 }
 
 void usb_disconnect(void) {

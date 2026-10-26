@@ -9,6 +9,7 @@
 #include "py/mpstate.h"
 #include "py/runtime.h"
 
+#include "bindings/espidf/__init__.h"
 #include "shared-bindings/wifi/Monitor.h"
 #include "shared-bindings/wifi/Packet.h"
 
@@ -29,6 +30,12 @@ static const char *TAG = "monitor";
 static void wifi_monitor_cb(void *recv_buf, wifi_promiscuous_pkt_type_t type) {
     wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)recv_buf;
 
+    // Construct enables promiscuous mode before make_new sets the singleton.
+    wifi_monitor_obj_t *self = MP_STATE_VM(wifi_monitor_singleton);
+    if (self == NULL || common_hal_wifi_monitor_deinited(self)) {
+        return;
+    }
+
     // prepare packet
     monitor_packet_t packet = {
         .channel = pkt->rx_ctrl.channel,
@@ -42,14 +49,11 @@ static void wifi_monitor_cb(void *recv_buf, wifi_promiscuous_pkt_type_t type) {
         packet.payload = malloc(packet.length);
         if (packet.payload) {
             memcpy(packet.payload, pkt->payload, packet.length);
-            wifi_monitor_obj_t *self = MP_STATE_VM(wifi_monitor_singleton);
-            if (self->queue) {
-                // send packet
-                if (xQueueSendFromISR(self->queue, &packet, NULL) != pdTRUE) {
-                    self->lost++;
-                    free(packet.payload);
-                    ESP_LOGE(TAG, "packet queue full");
-                }
+            // send packet
+            if (xQueueSendFromISR(self->queue, &packet, NULL) != pdTRUE) {
+                self->lost++;
+                free(packet.payload);
+                ESP_LOGE(TAG, "packet queue full");
             }
         } else {
             ESP_LOGE(TAG, "not enough memory for packet");
@@ -57,8 +61,25 @@ static void wifi_monitor_cb(void *recv_buf, wifi_promiscuous_pkt_type_t type) {
     }
 }
 
+// Tune the radio and return the channel it is on afterwards. Raises
+// ValueError for a channel this radio cannot use. Any other failure, for
+// example while the station is associated, leaves the radio where it was.
+static uint8_t set_channel(uint8_t channel) {
+    esp_err_t result = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+    if (result == ESP_ERR_INVALID_ARG) {
+        mp_arg_error_invalid(MP_QSTR_channel);
+    } else if (result != ESP_OK) {
+        wifi_second_chan_t second;
+        CHECK_ESP_RESULT(esp_wifi_get_channel(&channel, &second));
+    }
+    return channel;
+}
+
 void common_hal_wifi_monitor_construct(wifi_monitor_obj_t *self, uint8_t channel, size_t queue) {
     mp_rom_error_text_t monitor_mode_init_error = MP_ERROR_TEXT("monitor init failed");
+
+    // Before anything needs undoing on failure.
+    channel = set_channel(channel);
 
     self->queue = xQueueCreate(queue, sizeof(monitor_packet_t));
     if (!self->queue) {
@@ -74,19 +95,17 @@ void common_hal_wifi_monitor_construct(wifi_monitor_obj_t *self, uint8_t channel
     if (esp_wifi_set_promiscuous(true) != ESP_OK) {
         mp_raise_RuntimeError(monitor_mode_init_error);
     }
-    esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
 
     self->channel = channel;
     self->queue_length = queue;
 }
 
-bool common_hal_wifi_monitor_deinited(void) {
-    bool enabled;
-    return (esp_wifi_get_promiscuous(&enabled) == ESP_ERR_WIFI_NOT_INIT) ? true : !enabled;
+bool common_hal_wifi_monitor_deinited(wifi_monitor_obj_t *self) {
+    return self->queue == NULL;
 }
 
 void common_hal_wifi_monitor_deinit(wifi_monitor_obj_t *self) {
-    if (common_hal_wifi_monitor_deinited()) {
+    if (common_hal_wifi_monitor_deinited(self)) {
         return;
     }
 
@@ -102,11 +121,12 @@ void common_hal_wifi_monitor_deinit(wifi_monitor_obj_t *self) {
     }
     vQueueDelete(self->queue);
     self->queue = NULL;
+    // Root pointers outlive the VM heap.
+    MP_STATE_VM(wifi_monitor_singleton) = NULL;
 }
 
 void common_hal_wifi_monitor_set_channel(wifi_monitor_obj_t *self, uint8_t channel) {
-    self->channel = channel;
-    esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+    self->channel = set_channel(channel);
 }
 
 mp_obj_t common_hal_wifi_monitor_get_channel(wifi_monitor_obj_t *self) {

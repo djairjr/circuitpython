@@ -266,6 +266,7 @@ SRC_PERIPHERALS := \
 	peripherals/samd/$(PERIPHERALS_CHIP_FAMILY)/pins.c \
 	peripherals/samd/$(PERIPHERALS_CHIP_FAMILY)/sercom.c \
 	peripherals/samd/$(PERIPHERALS_CHIP_FAMILY)/timers.c \
+	peripherals/samd/adc.c \
 	peripherals/samd/clocks.c \
 	peripherals/samd/dma.c \
 	peripherals/samd/events.c \
@@ -311,6 +312,7 @@ endif
 
 ifeq ($(CHIP_FAMILY), samd21)
 SRC_S += shared/runtime/gchelper_thumb1.s
+SRC_S += libgcc_thumb1.s
 else
 SRC_S += shared/runtime/gchelper_thumb2.s
 endif
@@ -348,7 +350,7 @@ $(BUILD)/firmware.elf: $(OBJ) $(GENERATED_LD_FILE)
 	$(STEPECHO) "LINK $@"
 	$(Q)echo $(OBJ) > $(BUILD)/firmware.objs
 	$(Q)$(CC) -o $@ $(LDFLAGS) @$(BUILD)/firmware.objs -Wl,--print-memory-usage -Wl,--start-group $(LIBS) -Wl,--end-group
-	$(Q)$(SIZE) $@ | $(PYTHON) $(TOP)/tools/build_memory_info.py $(GENERATED_LD_FILE) $(BUILD)
+	$(Q)$(SIZE) $@ | $(PYTHON) $(TOP)/tools/build_memory_info.py $@.map $(BUILD)
 endif
 
 $(BUILD)/firmware.bin: $(BUILD)/firmware.elf

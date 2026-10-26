@@ -19,7 +19,11 @@
 //|     def __init__(self, channel: Optional[int] = 1, queue: Optional[int] = 128) -> None:
 //|         """Initialize `wifi.Monitor` singleton.
 //|
-//|         :param int channel: The WiFi channel to scan.
+//|         :param int channel: The WiFi channel to scan. On dual-band radios,
+//|             5 GHz channels (36 and above) may also be given. A channel the
+//|             radio does not support raises `ValueError`. While the station is
+//|             connected the radio stays on the station's channel, and
+//|             `channel` reports that channel.
 //|         :param int queue: The queue size for buffering the packet.
 //|
 //|         """
@@ -35,12 +39,14 @@ static mp_obj_t wifi_monitor_make_new(const mp_obj_type_t *type, size_t n_args, 
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
     mp_arg_parse_all_kw_array(n_args, n_kw, all_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
 
-    mp_int_t channel = mp_arg_validate_int_range(args[ARG_channel].u_int, 1, 13, MP_QSTR_channel);
+    // 165 is the highest channel in the scan pattern. Channels the radio
+    // doesn't support are rejected by the port rather than here.
+    mp_int_t channel = mp_arg_validate_int_range(args[ARG_channel].u_int, 1, 165, MP_QSTR_channel);
     mp_int_t queue = mp_arg_validate_int_min(args[ARG_queue].u_int, 0, MP_QSTR_queue);
 
     wifi_monitor_obj_t *self = MP_STATE_VM(wifi_monitor_singleton);
-    if (common_hal_wifi_monitor_deinited()) {
-        self = mp_obj_malloc(wifi_monitor_obj_t, &wifi_monitor_type);
+    if (self == NULL || common_hal_wifi_monitor_deinited(self)) {
+        self = mp_obj_malloc_with_finaliser(wifi_monitor_obj_t, &wifi_monitor_type);
         common_hal_wifi_monitor_construct(self, channel, queue);
         MP_STATE_VM(wifi_monitor_singleton) = self;
     }
@@ -49,17 +55,16 @@ static mp_obj_t wifi_monitor_make_new(const mp_obj_type_t *type, size_t n_args, 
 }
 
 //|     channel: int
-//|     """The WiFi channel to scan."""
+//|     """The WiFi channel to scan. A channel the radio does not support raises
+//|     `ValueError`. While the station is connected the radio stays on the
+//|     station's channel, and this reports that channel."""
 static mp_obj_t wifi_monitor_obj_get_channel(mp_obj_t self_in) {
     return common_hal_wifi_monitor_get_channel(self_in);
 }
 MP_DEFINE_CONST_FUN_OBJ_1(wifi_monitor_get_channel_obj, wifi_monitor_obj_get_channel);
 
 static mp_obj_t wifi_monitor_obj_set_channel(mp_obj_t self_in, mp_obj_t channel) {
-    mp_int_t c = mp_obj_get_int(channel);
-    if (c < 1 || c > 13) {
-        mp_raise_ValueError_varg(MP_ERROR_TEXT("%q out of bounds"), MP_QSTR_channel);
-    }
+    mp_int_t c = mp_arg_validate_int_range(mp_obj_get_int(channel), 1, 165, MP_QSTR_channel);
     common_hal_wifi_monitor_set_channel(self_in, c);
     return mp_const_none;
 }
@@ -104,7 +109,7 @@ MP_DEFINE_CONST_FUN_OBJ_1(wifi_monitor_lost_obj, wifi_monitor_obj_get_lost);
 //|         ...
 //|
 static mp_obj_t wifi_monitor_obj_get_queued(mp_obj_t self_in) {
-    if (common_hal_wifi_monitor_deinited()) {
+    if (common_hal_wifi_monitor_deinited(self_in)) {
         return mp_obj_new_int_from_uint(0);
     }
     return common_hal_wifi_monitor_get_queued(self_in);
@@ -117,7 +122,7 @@ MP_DEFINE_CONST_FUN_OBJ_1(wifi_monitor_queued_obj, wifi_monitor_obj_get_queued);
 //|
 //|
 static mp_obj_t wifi_monitor_obj_get_packet(mp_obj_t self_in) {
-    if (common_hal_wifi_monitor_deinited()) {
+    if (common_hal_wifi_monitor_deinited(self_in)) {
         raise_deinited_error();
     }
     return common_hal_wifi_monitor_get_packet(self_in);
@@ -131,6 +136,7 @@ static const mp_rom_map_elem_t wifi_monitor_locals_dict_table[] = {
 
     // functions
     { MP_ROM_QSTR(MP_QSTR_deinit),  MP_ROM_PTR(&wifi_monitor_deinit_obj) },
+    { MP_ROM_QSTR(MP_QSTR___del__), MP_ROM_PTR(&wifi_monitor_deinit_obj) },
     { MP_ROM_QSTR(MP_QSTR_lost),    MP_ROM_PTR(&wifi_monitor_lost_obj) },
     { MP_ROM_QSTR(MP_QSTR_queued),  MP_ROM_PTR(&wifi_monitor_queued_obj) },
     { MP_ROM_QSTR(MP_QSTR_packet),  MP_ROM_PTR(&wifi_monitor_packet_obj) },

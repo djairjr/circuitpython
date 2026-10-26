@@ -82,7 +82,10 @@ static NRF_PWM_Type *find_free_pwm(void) {
 }
 
 static size_t pixels_pattern_heap_size = 0;
-// Called during reset_port() to free the pattern buffer
+// Clear the root pointer during reset_port() while the old GC heap (and the pattern
+// buffer in it) is still alive. Root pointers are NOT zeroed between VM runs, so
+// without this the pointer would dangle after the heap is torn down and re-created.
+// The now-unreferenced block is reclaimed by the final sweep in gc_deinit().
 void neopixel_write_reset(void) {
     MP_STATE_VM(pixels_pattern_heap) = NULL;
     pixels_pattern_heap_size = 0;
@@ -125,7 +128,9 @@ void common_hal_neopixel_write(const digitalio_digitalinout_obj_t *digitalinout,
             pixels_pattern = (uint16_t *)stack_pixels;
         } else {
             uint8_t sd_en = 0;
+            #ifdef BLUETOOTH_SD
             (void)sd_softdevice_is_enabled(&sd_en);
+            #endif
 
             if (pixels_pattern_heap_size < pattern_size) {
                 // Current heap buffer is too small.

@@ -14,6 +14,7 @@
 #include <zephyr/sys/slist.h>
 
 #include "py/runtime.h"
+#include "shared/runtime/interrupt_char.h"
 #include "bindings/zephyr_kernel/__init__.h"
 #include "shared-bindings/_bleio/__init__.h"
 #include "shared-bindings/_bleio/Characteristic.h"
@@ -24,7 +25,6 @@
 #include "common-hal/_bleio/__init__.h"
 #include "common-hal/_bleio/Characteristic.h"
 #include "supervisor/port_heap.h"
-#include "supervisor/shared/tick.h"
 
 // Discovery context passed through Zephyr callbacks.
 typedef struct {
@@ -76,6 +76,18 @@ typedef struct {
 static discovery_context_t *active_discovery_ctx;
 static sys_slist_t discovered_list;
 static struct bt_gatt_discover_params discovery_params;
+
+// Called from the disconnect callback (BT workqueue context) to abort any
+// in-flight GATT discovery. Without this the main thread's spin loop would
+// hang waiting for a callback that will never come, and the caller would then
+// NULL-dereference the now-cleared connection in bt_gatt_discover().
+void bleio_connection_discovery_abort(void) {
+    discovery_context_t *ctx = active_discovery_ctx;
+    if (ctx != NULL) {
+        ctx->err = -ENOTCONN;
+        ctx->done = true;
+    }
+}
 
 static uint8_t on_service_discovered(struct bt_conn *conn,
     const struct bt_gatt_attr *attr,
@@ -152,6 +164,8 @@ typedef struct {
 
 // Forward declaration for use by descriptor discovery.
 static void free_discovered_list(void);
+static void bleio_discovery_check_connected(struct bt_conn *conn,
+    discovery_context_t *ctx);
 
 // Callback for descriptor discovery.
 static uint8_t on_descriptor_discovered(struct bt_conn *conn,
@@ -237,6 +251,8 @@ static void create_descriptors_from_discovered(bleio_characteristic_obj_t *chara
 static void discover_descriptors_for_characteristic(struct bt_conn *conn,
     discovery_context_t *ctx, bleio_characteristic_obj_t *characteristic,
     uint16_t end_handle) {
+    // Bail cleanly if the link dropped before this phase began.
+    bleio_discovery_check_connected(conn, ctx);
     uint16_t start = characteristic->handle + 1;
     if (start > end_handle) {
         return;
@@ -265,6 +281,9 @@ static void discover_descriptors_for_characteristic(struct bt_conn *conn,
     while (!ctx->done) {
         RUN_BACKGROUND_TASKS;
     }
+
+    // The link may have dropped while we were waiting.
+    bleio_discovery_check_connected(conn, ctx);
 
     create_descriptors_from_discovered(characteristic);
 }
@@ -332,9 +351,25 @@ static void free_discovered_list(void) {
     }
 }
 
+// The link dropped during discovery: the disconnect callback cleared
+// connection->conn (so a subsequent bt_gatt_discover() would NULL-deref, since
+// CONFIG_ASSERT is off) and/or aborted the active discovery (ctx->err set).
+// Stop discovery cleanly with a "Not connected" exception instead of
+// crashing or hanging on the spin loop.
+static void bleio_discovery_check_connected(struct bt_conn *conn,
+    discovery_context_t *ctx) {
+    if (conn == NULL || ctx->err != 0) {
+        free_discovered_list();
+        active_discovery_ctx = NULL;
+        mp_raise_bleio_BluetoothError(MP_ERROR_TEXT("Not connected"));
+    }
+}
+
 // Discover characteristics for a single remote service.
 static void discover_characteristics_for_service(struct bt_conn *conn,
     discovery_context_t *ctx, bleio_service_obj_t *service) {
+    // Bail cleanly if the link dropped before this phase began.
+    bleio_discovery_check_connected(conn, ctx);
     // Need at least 2 handles: one for the service declaration, one for a characteristic
     if (service->end_handle <= service->start_handle) {
         return;
@@ -365,6 +400,9 @@ static void discover_characteristics_for_service(struct bt_conn *conn,
         RUN_BACKGROUND_TASKS;
     }
 
+    // The link may have dropped while we were waiting.
+    bleio_discovery_check_connected(conn, ctx);
+
     // Create CP objects outside of callback context where MP allocations are safe.
     // This drains and frees the list nodes.
     char_with_decl_t chars[16];
@@ -385,8 +423,107 @@ static void discover_characteristics_for_service(struct bt_conn *conn,
     }
 }
 
+// ===== PAIRING / BONDING =====
+
+// Auth info callbacks to track pairing completion/failure
+static struct bt_conn_auth_info_cb auth_info_cb;
+static bool auth_info_cb_registered = false;
+
+static void on_pairing_complete(struct bt_conn *conn, bool bonded) {
+    for (size_t i = 0; i < BLEIO_TOTAL_CONNECTION_COUNT; i++) {
+        if (bleio_connections[i].conn == conn) {
+            bleio_connections[i].pair_status = PAIR_PAIRED;
+            bleio_connections[i].sec_err = 0;
+            break;
+        }
+    }
+}
+
+static void on_pairing_failed(struct bt_conn *conn, enum bt_security_err reason) {
+    for (size_t i = 0; i < BLEIO_TOTAL_CONNECTION_COUNT; i++) {
+        if (bleio_connections[i].conn == conn) {
+            bleio_connections[i].pair_status = PAIR_NOT_PAIRED;
+            bleio_connections[i].sec_err = (uint8_t)reason;
+            break;
+        }
+    }
+}
+
+void bleio_connection_register_auth_callbacks(void) {
+    if (!auth_info_cb_registered) {
+        auth_info_cb.pairing_complete = on_pairing_complete;
+        auth_info_cb.pairing_failed = on_pairing_failed;
+        bt_conn_auth_info_cb_register(&auth_info_cb);
+        auth_info_cb_registered = true;
+    }
+}
+
 void common_hal_bleio_connection_pair(bleio_connection_internal_t *self, bool bond) {
-    mp_raise_NotImplementedError(NULL);
+    (void)bond; // Bonding is enabled globally via CONFIG_BT_BONDABLE=y
+
+    if (self == NULL || self->conn == NULL) {
+        mp_raise_bleio_BluetoothError(MP_ERROR_TEXT("Not connected"));
+    }
+
+    // Already paired?
+    if (self->pair_status == PAIR_PAIRED) {
+        return;
+    }
+
+    // Ensure auth callbacks are registered
+    bleio_connection_register_auth_callbacks();
+
+    self->pair_status = PAIR_WAITING;
+    self->sec_err = 0;
+
+    int err = bt_conn_set_security(self->conn, BT_SECURITY_L2);
+    if (err != 0) {
+        self->pair_status = PAIR_NOT_PAIRED;
+        raise_zephyr_error(err);
+    }
+
+    // bt_conn_set_security may return 0 immediately if already encrypted
+    // (e.g., reconnection with stored bond keys). Check current security level.
+    if (bt_conn_get_security(self->conn) > BT_SECURITY_L1) {
+        self->pair_status = PAIR_PAIRED;
+        return;
+    }
+
+    // Wait for pairing to complete. Zephyr's SMP reports each attempt via
+    // pairing_failed before auto-restarting security (smp.c), so a stale-bond
+    // retry shows up as an intermediate BT_SECURITY_ERR_PIN_OR_KEY_MISSING
+    // followed by a fresh attempt that can succeed. Ride through those and
+    // rely on Zephyr to signal the end: success (PAIR_PAIRED), SMP_TIMEOUT
+    // dropping the link (observed as conn == NULL), or a user interrupt.
+    while (self->pair_status != PAIR_PAIRED
+           && self->conn != NULL
+           && !mp_hal_is_interrupted()) {
+        RUN_BACKGROUND_TASKS;
+    }
+
+    if (mp_hal_is_interrupted()) {
+        if (self->conn != NULL) {
+            bt_conn_auth_cancel(self->conn);
+        }
+        self->pair_status = PAIR_NOT_PAIRED;
+        return;
+    }
+
+    if (self->pair_status == PAIR_PAIRED) {
+        return;
+    }
+
+    // Reuse the messages shared with the nordic _bleio implementation
+    // (check_sec_status). A dropped link clears sec_err, so it falls through
+    // to the "unspecified issue" message alongside the explicit UNSPECIFIED
+    // error code rather than introducing a zephyr-specific "Pairing failed"
+    // string.
+    uint8_t sec_err_code = self->sec_err;
+    if (sec_err_code == BT_SECURITY_ERR_UNSPECIFIED || sec_err_code == 0) {
+        mp_raise_bleio_SecurityError(MP_ERROR_TEXT("Unspecified issue. The pairing request on the other device may have been declined or ignored."));
+    } else {
+        mp_raise_bleio_SecurityError(MP_ERROR_TEXT("Unknown security error: 0x%04x"), sec_err_code);
+    }
 }
 
 void common_hal_bleio_connection_disconnect(bleio_connection_internal_t *self) {
@@ -434,7 +571,25 @@ mp_int_t common_hal_bleio_connection_get_max_packet_length(bleio_connection_inte
 }
 
 bool common_hal_bleio_connection_get_paired(bleio_connection_obj_t *self) {
+    if (self == NULL || self->connection == NULL) {
+        return false;
+    }
+    return self->connection->pair_status == PAIR_PAIRED;
+}
+
+// Authenticated (MITM-protected) pairing - numeric comparison - is implemented on the
+// espressif port only. This port can't tell a "Just Works" bond from an authenticated
+// one, so report the conservative answer rather than a guarantee it can't make.
+bool common_hal_bleio_connection_get_authenticated(bleio_connection_obj_t *self) {
     return false;
+}
+
+mp_obj_t common_hal_bleio_connection_get_numeric_comparison(bleio_connection_obj_t *self) {
+    return mp_const_none;
+}
+
+void common_hal_bleio_connection_confirm_pairing(bleio_connection_obj_t *self, bool accept) {
+    mp_raise_NotImplementedError(NULL);
 }
 
 mp_obj_tuple_t *common_hal_bleio_connection_discover_remote_services(bleio_connection_obj_t *self, mp_obj_t service_uuids_whitelist) {
@@ -474,6 +629,9 @@ mp_obj_tuple_t *common_hal_bleio_connection_discover_remote_services(bleio_conne
         while (!ctx.done) {
             RUN_BACKGROUND_TASKS;
         }
+
+        // The link may have dropped during primary discovery.
+        bleio_discovery_check_connected(connection->conn, &ctx);
     } else {
         mp_obj_iter_buf_t iter_buf;
         mp_obj_t iterable = mp_getiter(service_uuids_whitelist, &iter_buf);
@@ -516,6 +674,10 @@ mp_obj_tuple_t *common_hal_bleio_connection_discover_remote_services(bleio_conne
             while (!ctx.done) {
                 RUN_BACKGROUND_TASKS;
             }
+
+            // The link may have dropped during this UUID's discovery; stop
+            // before the next iteration clears ctx.err and crashes on a NULL conn.
+            bleio_discovery_check_connected(connection->conn, &ctx);
         }
     }
 
@@ -538,6 +700,9 @@ mp_obj_tuple_t *common_hal_bleio_connection_discover_remote_services(bleio_conne
     for (size_t i = 0; i < result_list->len; i++) {
         bleio_service_obj_t *svc = MP_OBJ_TO_PTR(result_list->items[i]);
         if (svc->start_handle < svc->end_handle) {
+            // discover_characteristics_for_service re-checks, but guard here
+            // too so we don't enter the phase after a mid-loop disconnect.
+            bleio_discovery_check_connected(connection->conn, &ctx);
             discover_characteristics_for_service(connection->conn, &ctx, svc);
         }
     }

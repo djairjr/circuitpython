@@ -27,6 +27,10 @@
 #include "audio_dma.h"
 #endif
 
+#if CIRCUITPY_PICODVI_AUDIOOUT
+#include "common-hal/picodvi/AudioOut.h"
+#endif
+
 #if CIRCUITPY_SSL
 #include "shared-module/ssl/__init__.h"
 #include "psa/crypto.h"
@@ -47,6 +51,8 @@
 #include "supervisor/shared/stack.h"
 #include "supervisor/shared/tick.h"
 
+#include "hardware/clocks.h"
+#include "hardware/structs/psm.h"
 #include "hardware/structs/scb.h"
 #include "hardware/structs/watchdog.h"
 #include "hardware/gpio.h"
@@ -152,7 +158,11 @@ static size_t _psram_size = 0;
 #include "hardware/structs/xip_ctrl.h"
 
 static void __no_inline_not_in_flash_func(setup_psram)(void) {
-    gpio_set_function(CIRCUITPY_PSRAM_CHIP_SELECT->number, GPIO_FUNC_XIP_CS1);
+    // Read the system clock and the chip select pin before QMI goes into
+    // direct mode. Both are in flash, and flash reads fault in direct mode.
+    uint32_t sys_clk_khz = clock_get_hz(clk_sys) / 1000;
+    const uint8_t cs_pin = CIRCUITPY_PSRAM_CHIP_SELECT->number;
+    gpio_set_function(cs_pin, GPIO_FUNC_XIP_CS1);
     _psram_size = 0;
     common_hal_mcu_disable_interrupts();
     // Try and read the PSRAM ID via direct_csr.
@@ -202,10 +212,10 @@ static void __no_inline_not_in_flash_func(setup_psram)(void) {
 
     if (kgd != 0x5D) {
         common_hal_mcu_enable_interrupts();
-        reset_pin_number(CIRCUITPY_PSRAM_CHIP_SELECT->number);
+        reset_pin_number(cs_pin);
         return;
     }
-    never_reset_pin_number(CIRCUITPY_PSRAM_CHIP_SELECT->number);
+    never_reset_pin_number(cs_pin);
 
     // Enable quad mode.
     qmi_hw->direct_csr = 30 << QMI_DIRECT_CSR_CLKDIV_LSB |
@@ -237,14 +247,7 @@ static void __no_inline_not_in_flash_func(setup_psram)(void) {
     // Disable direct csr.
     qmi_hw->direct_csr &= ~(QMI_DIRECT_CSR_ASSERT_CS1N_BITS | QMI_DIRECT_CSR_EN_BITS);
 
-    qmi_hw->m[1].timing =
-        QMI_M0_TIMING_PAGEBREAK_VALUE_1024 << QMI_M0_TIMING_PAGEBREAK_LSB | // Break between pages.
-            3 << QMI_M0_TIMING_SELECT_HOLD_LSB | // Delay releasing CS for 3 extra system cycles.
-            1 << QMI_M0_TIMING_COOLDOWN_LSB |
-            1 << QMI_M0_TIMING_RXDELAY_LSB |
-            16 << QMI_M0_TIMING_MAX_SELECT_LSB | // In units of 64 system clock cycles. PSRAM says 8us max. 8 / 0.00752 / 64 = 16.62
-            7 << QMI_M0_TIMING_MIN_DESELECT_LSB | // In units of system clock cycles. PSRAM says 50ns.50 / 7.52 = 6.64
-            2 << QMI_M0_TIMING_CLKDIV_LSB;
+    mcu_processor_update_psram_timing(sys_clk_khz);
     qmi_hw->m[1].rfmt = (QMI_M0_RFMT_PREFIX_WIDTH_VALUE_Q << QMI_M0_RFMT_PREFIX_WIDTH_LSB |
             QMI_M0_RFMT_ADDR_WIDTH_VALUE_Q << QMI_M0_RFMT_ADDR_WIDTH_LSB |
             QMI_M0_RFMT_SUFFIX_WIDTH_VALUE_Q << QMI_M0_RFMT_SUFFIX_WIDTH_LSB |
@@ -307,17 +310,17 @@ void port_heap_init(void) {
 }
 
 void *port_malloc(size_t size, bool dma_capable) {
-    if (!dma_capable && _psram_size > 0) {
-        common_hal_mcu_disable_interrupts();
-        void *block = tlsf_malloc(_psram_heap, size);
-        common_hal_mcu_enable_interrupts();
-        if (block) {
-            return block;
-        }
-    }
+    // Prefer internal RAM for everything: it is much faster than PSRAM
+    // (data there skips the external bus and the shared XIP cache). PSRAM, when
+    // present, serves as spillover capacity for allocations that don't need DMA.
     common_hal_mcu_disable_interrupts();
     void *block = tlsf_malloc(_heap, size);
     common_hal_mcu_enable_interrupts();
+    if (block == NULL && !dma_capable && _psram_size > 0) {
+        common_hal_mcu_disable_interrupts();
+        block = tlsf_malloc(_psram_heap, size);
+        common_hal_mcu_enable_interrupts();
+    }
     return block;
 }
 
@@ -332,7 +335,11 @@ void port_free(void *ptr) {
 }
 
 void *port_realloc(void *ptr, size_t size, bool dma_capable) {
-    if (_psram_size > 0 && ((ptr != NULL && ((size_t)ptr) < SRAM_BASE) || (ptr == NULL && !dma_capable))) {
+    if (ptr == NULL) {
+        // Fresh allocation: same internal-first policy as port_malloc.
+        return port_malloc(size, dma_capable);
+    }
+    if (_psram_size > 0 && ((size_t)ptr) < SRAM_BASE) {
         common_hal_mcu_disable_interrupts();
         void *block = tlsf_realloc(_psram_heap, ptr, size);
         common_hal_mcu_enable_interrupts();
@@ -347,7 +354,7 @@ void *port_realloc(void *ptr, size_t size, bool dma_capable) {
 }
 
 #if !CIRCUITPY_ALL_MEMORY_DMA_CAPABLE
-bool port_buffer_is_dma_capable(const void *ptr) {
+bool port_buffer_is_dma_capable(const void *ptr, size_t len) {
     // For RP2350, DMA can only access SRAM, not PSRAM
     // PSRAM addresses are below SRAM_BASE
     return ptr != NULL && ((size_t)ptr) >= SRAM_BASE;
@@ -499,6 +506,10 @@ void reset_port(void) {
     audio_dma_reset();
     #endif
 
+    #if CIRCUITPY_PICODVI_AUDIOOUT
+    picodvi_audioout_reset();
+    #endif
+
     #if CIRCUITPY_SSL
     ssl_reset();
 
@@ -526,9 +537,15 @@ void reset_to_bootloader(void) {
     }
 }
 
-void reset_cpu(void) {
-    watchdog_reboot(0, SRAM_END, 0);
-    watchdog_start_tick(12);
+// Called from isr_hardfault(), so this and everything it calls runs from RAM.
+// Same register sequence as watchdog_reboot(0, 0, 0), which is in flash.
+void __not_in_flash_func(reset_cpu)(void) {
+    hw_clear_bits(&watchdog_hw->ctrl, WATCHDOG_CTRL_ENABLE_BITS);
+    watchdog_hw->scratch[4] = 0;
+    hw_set_bits(&psm_hw->wdsel, PSM_WDSEL_BITS & ~(PSM_WDSEL_ROSC_BITS | PSM_WDSEL_XOSC_BITS));
+    hw_clear_bits(&watchdog_hw->ctrl,
+        WATCHDOG_CTRL_PAUSE_DBG0_BITS | WATCHDOG_CTRL_PAUSE_DBG1_BITS | WATCHDOG_CTRL_PAUSE_JTAG_BITS);
+    hw_set_bits(&watchdog_hw->ctrl, WATCHDOG_CTRL_TRIGGER_BITS);
 
     while (true) {
         __wfi();
@@ -559,7 +576,7 @@ uint32_t *port_heap_get_top(void) {
 }
 
 uint32_t __uninitialized_ram(saved_word);
-void port_set_saved_word(uint32_t value) {
+void __not_in_flash_func(port_set_saved_word)(uint32_t value) {
     // Store in RAM because the watchdog scratch registers don't survive
     // resetting by pulling the RUN pin low.
     saved_word = value;

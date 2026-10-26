@@ -1511,6 +1511,8 @@ def read_raw_code(reader, parent_name, qstr_table, obj_table, segments):
 
 
 def read_mpy(filename):
+    import re
+
     with open(filename, "rb") as fileobj:
         reader = MPYReader(filename, fileobj)
         segments = []
@@ -1556,7 +1558,10 @@ def read_mpy(filename):
             obj_table.append(read_obj(reader, segments))
 
         # Compute the compiled-module escaped name.
-        cm_escaped_name = qstr_table[0].str.replace("/", "_")[:-3]
+        module_name = qstr_table[0].str
+        if not all(0x7F >= ord(codepoint) >= 0x20 for codepoint in module_name):
+            raise MPYReadError(filename, "cannot have unicode characters in module name")
+        cm_escaped_name = re.sub("[^a-zA-Z0-9_]", "_", "_".join(module_name.split(".")[:-1]))
 
         # Read the outer raw code, which will in turn read all its children.
         raw_code_file_offset = reader.tell()
@@ -1673,12 +1678,27 @@ def freeze_mpy(firmware_qstr_idents, compiled_modules):
             print("    %d," % qhash)
             qstr_content += config.MICROPY_QSTR_BYTES_IN_HASH
         print("};")
+    # CIRCUITPY-CHANGE: ROM pools store their strings in one NUL-separated blob
+    # addressed by 16-bit offsets, with a trailing end-of-blob offset. See py/qstr.h.
     print()
-    print("const qstr_len_t mp_qstr_frozen_const_lengths[] = {")
-    for _, _, _, qbytes in new:
-        print("    %d," % len(qbytes))
-        qstr_content += config.MICROPY_QSTR_BYTES_IN_LEN
-        qstr_content += len(qbytes) + 1  # include NUL
+    print("const char mp_qstr_frozen_const_blob[] =")
+    offsets = []
+    offset = 0
+    for _, _, qstr, qbytes in new:
+        print('    "%s" "\\0"' % qstrutil.escape_bytes(qstr, qbytes))
+        offsets.append(offset)
+        offset += len(qbytes) + 1  # include NUL
+        qstr_content += len(qbytes) + 1
+    print("    ;")
+    if offset >= qstrutil.QSTR_BLOB_MAX:
+        raise SystemExit("frozen qstr blob is too large: %d bytes" % offset)
+    print()
+    print("const qstr_offset_t mp_qstr_frozen_const_offsets[] = {")
+    for offset in offsets:
+        print("    %d," % offset)
+        qstr_content += 2
+    print("    sizeof(mp_qstr_frozen_const_blob) - 1,")
+    qstr_content += 2
     print("};")
     print()
     print("extern const qstr_pool_t mp_qstr_const_pool;")
@@ -1690,11 +1710,9 @@ def freeze_mpy(firmware_qstr_idents, compiled_modules):
     print("    %u, // used entries" % len(new))
     if config.MICROPY_QSTR_BYTES_IN_HASH:
         print("    (qstr_hash_t *)mp_qstr_frozen_const_hashes,")
-    print("    (qstr_len_t *)mp_qstr_frozen_const_lengths,")
-    print("    {")
-    for _, _, qstr, qbytes in new:
-        print('        "%s",' % qstrutil.escape_bytes(qstr, qbytes))
-    print("    },")
+    print("    NULL, // lengths; strings live in the blob")
+    print("    mp_qstr_frozen_const_blob,")
+    print("    mp_qstr_frozen_const_offsets,")
     print("};")
 
     # Freeze all modules.
@@ -1737,7 +1755,7 @@ def freeze_mpy(firmware_qstr_idents, compiled_modules):
         if module_name.endswith("/__init__.py"):
             short_name = module_name[: -len("/__init__.py")]
         else:
-            short_name = module_name[: -len(".py")]
+            short_name = ".".join(module_name.split(".")[:-1])
         print('MICROPY_FROZEN_LIST_ITEM("%s", "%s")' % (short_name, module_name))
     print("#endif")
 
